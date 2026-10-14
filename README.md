@@ -25,7 +25,7 @@ Neos learns both **how to acquire evidence** and **how to use it to guide subseq
 
 ## 🔔 Timeline
 
-- **2026-10-10:** Released our training and inference code.
+- **2026-10-14:** Released our training and inference code.
 
 ## ⚙️ Configuration
 
