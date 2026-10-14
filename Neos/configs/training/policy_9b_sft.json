@@ -1,0 +1,10 @@
+{
+  "name": "policy-9b-full-sft", "model": "", "model_type": "qwen3_5",
+  "dataset": "", "output": "",
+  "path_settings": {"model": "NEOS_BASE_MODEL_9B", "dataset": "NEOS_SFT_DATA"},
+  "output_subdir": "sft/policy-9b",
+  "nodes": 1, "gpus_per_node": 8, "tp": 4, "cp": 2, "pp": 1, "ep": 1, "etp": 1,
+  "micro_batch": 1, "global_batch": 8, "epochs": 2, "learning_rate": 1e-5, "min_lr": 1e-6,
+  "max_length": 131072, "padding_free": true, "group_by_length": false,
+  "optimizer_cpu_offload": true, "preserve_thinking": true, "freeze_router": false
+}

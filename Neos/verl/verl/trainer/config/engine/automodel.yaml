@@ -1,0 +1,85 @@
+                                     
+_target_: verl.workers.config.AutomodelEngineConfig
+
+                             
+strategy: automodel
+
+                                                                   
+distributed_strategy: fsdp2
+
+                   
+tp_size: 1
+pp_size: 1
+cp_size: 1
+ep_size: 1
+dp_replicate_size: 1
+sequence_parallel: false
+defer_fsdp_grad_sync: true
+
+                                            
+param_offload: false
+
+                                           
+optimizer_offload: false
+
+                                            
+activation_checkpointing: false
+
+                                
+enable_fp8: false
+
+                                               
+enable_compile: false
+
+                                                              
+model_dtype: fp32
+
+                                                                       
+attn_implementation: flash_attention_2
+
+                  
+backend_config:
+  attn: sdpa                                    
+  linear: te                                     
+  rms_norm: torch_fp32                                         
+  rope_fusion: true
+  dispatcher: torch                                   
+  experts: gmm                                                      
+  gate_precision: null
+  enable_hf_state_dict_adapter: true
+  enable_fsdp_optimizations: false
+  fake_balanced_gate: false
+  fake_gate_noise: 0.0
+
+                                      
+moe_config:
+  ignore_router_for_ac: false
+  reshard_after_forward: false
+  lm_head_precision: null
+  wrap_outer_model: true
+
+                                                     
+mp_param_dtype: bf16
+mp_reduce_dtype: fp32
+mp_output_dtype: bf16
+
+                                 
+seed: 42
+
+                                                                                 
+full_determinism: false
+
+                                  
+forward_only: false
+
+                                                      
+use_torch_compile: false
+
+                                            
+entropy_from_logits_with_chunking: false
+
+                                                  
+entropy_from_logits_chunk_size: 2048
+
+                                                      
+entropy_checkpointing: false

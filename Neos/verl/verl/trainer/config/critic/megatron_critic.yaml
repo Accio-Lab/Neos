@@ -1,0 +1,35 @@
+                                                         
+defaults:
+
+                             
+  - ../optim@optim: megatron
+
+                          
+  - ../engine@megatron: megatron
+
+                                                                      
+  - critic
+
+                                                                                
+  - _self_
+
+                                                                                         
+_target_: verl.workers.config.McoreCriticConfig
+
+strategy: megatron
+
+                                                                                                                                                     
+nccl_timeout: 600
+
+                      
+data_loader_seed: ${oc.select:actor_rollout_ref.actor.data_loader_seed,null}
+
+                                                                            
+                                                           
+checkpoint:
+
+                                           
+  _target_: verl.workers.config.McoreCheckpointConfig
+
+                             
+  mbridge_config: {}

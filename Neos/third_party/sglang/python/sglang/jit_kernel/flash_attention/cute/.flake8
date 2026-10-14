@@ -1,0 +1,4 @@
+[flake8]
+max-line-length = 100
+                                         
+ignore = E731, E741, F841, W503

@@ -1,0 +1,155 @@
+                                                                                         
+_target_: verl.workers.config.McoreEngineConfig
+
+                                            
+param_offload: False
+
+                                     
+grad_offload: False
+
+                                           
+optimizer_offload: False
+
+                            
+tensor_model_parallel_size: 1
+
+                            
+expert_model_parallel_size: 1
+
+                                                     
+expert_tensor_parallel_size: null
+
+                              
+pipeline_model_parallel_size: 1
+
+                                      
+virtual_pipeline_model_parallel_size: null
+
+                       
+context_parallel_size: 1
+
+                   
+sequence_parallel: True
+
+                                      
+use_distributed_optimizer: True
+
+                                          
+use_dist_checkpointing: False
+
+                                
+dist_checkpointing_path: null
+
+                                           
+dynamic_context_parallel: False
+
+                                        
+max_seqlen_per_dp_cp_rank: null
+
+                                                                                                  
+dist_checkpointing_prefix: ''
+
+                                                                                                             
+dist_ckpt_optim_fully_reshardable: False
+
+                                                                      
+                                                                     
+distrib_optim_fully_reshardable_mem_efficient: False
+
+                                                  
+entropy_from_logits_with_chunking: False
+
+                                                  
+entropy_from_logits_chunk_size: 2048
+
+                                              
+seed: 42
+
+                                                          
+override_ddp_config: {}
+
+                                                                               
+                                                                     
+override_transformer_config:
+                                                                   
+                                                                  
+                                                          
+  recompute_granularity: null
+
+                                                                                                           
+                                              
+  recompute_modules: ["core_attn"]
+
+                      
+                                                                                                               
+                                                                                                      
+  recompute_method: null
+
+                                                                                                                           
+  recompute_num_layers: null
+
+                                                                                                       
+  attention_backend: flash
+
+override_mcore_model_config: {}
+
+                                                     
+use_mbridge: True
+
+                                                                                 
+                                                         
+vanilla_mbridge: False
+
+                                                                                                                             
+use_remove_padding: True
+
+                                                                                                                 
+                                                                                                                  
+                                                                     
+pad_bshd_to_minibatch_max: True
+
+                                                
+use_megatron_fsdp: False
+
+                             
+forward_only: False
+
+                                      
+dtype: bfloat16                          
+
+                                            
+router_replay:
+
+                                           
+  _target_: verl.workers.config.EngineRouterReplayConfig
+
+                                        
+                                               
+                                               
+  mode: disabled
+
+                                                
+                                                 
+  record_file: null
+
+                                                           
+                                  
+  replay_file: null
+
+                                                 
+qat:
+  _target_: verl.workers.config.QATEngineConfig
+                         
+  enable: false
+                                                                                    
+  mode: "w4a16"
+                                                             
+  group_size: 16
+                                                                                  
+  ignore_patterns:
+    - "lm_head"
+    - "*mlp.gate"
+                                                                                            
+  activation_observer: null
+                                                           
+  quantization_config_path: null

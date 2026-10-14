@@ -1,0 +1,16 @@
+                                                                          
+defaults:
+                               
+  - ../optim@optim: torchtitan
+
+                            
+  - ../engine@torchtitan: torchtitan
+
+  - actor
+
+                                                                                
+  - _self_
+
+_target_: verl.workers.config.TorchTitanActorConfig
+
+strategy: torchtitan

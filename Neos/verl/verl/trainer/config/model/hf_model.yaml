@@ -1,0 +1,163 @@
+                               
+                                           
+                                                   
+                                                                      
+                                                      
+
+_target_: verl.workers.config.HFModelConfig
+
+                               
+path: ~/models/deepseek-llm-7b-chat
+
+                                                                      
+hf_config_path: null
+
+                                                                       
+tokenizer_path: null
+
+                                                
+use_shm: False
+
+                               
+trust_remote_code: False
+
+                                    
+custom_chat_template: null
+
+                                            
+external_lib: null
+
+                    
+override_config: {}
+
+                                                                                      
+enable_gradient_checkpointing: True
+
+                                                                                  
+enable_activation_offload: False
+
+                                                                           
+use_remove_padding: True
+
+                                                 
+lora_rank: 0
+
+                     
+lora_alpha: 16
+
+                                    
+target_modules: all-linear
+
+                                      
+exclude_modules: null
+
+                                                                 
+lora_adapter_path: null
+
+                                                                  
+use_liger: False
+
+                               
+use_fused_kernels: False
+
+                       
+fused_kernel_options:
+
+                                                 
+  impl_backend: torch
+
+                                                              
+                                                                  
+tiled_mlp:
+
+                              
+  enabled: False
+
+                                                                                                              
+  num_shards: 4
+
+     
+mtp:
+
+  _target_: verl.workers.config.MtpConfig
+
+  enable: False
+  enable_train: False
+  enable_rollout: False
+
+  detach_encoder: False
+  mtp_loss_scaling_factor: 0.1
+
+  speculative_algorithm: EAGLE
+  speculative_num_steps: 3
+  speculative_eagle_topk: 1
+  speculative_num_draft_tokens: 4
+
+  method: mtp
+  num_speculative_tokens: 1
+
+                                                                              
+lora:
+                                                              
+  type: lora
+
+                                                                                                                                                                                                                                                            
+  merge: False
+
+                                                                                     
+  rank: 0                                 
+  
+                                                                 
+  alpha: 32
+  
+                                                             
+  dropout: 0.0
+  
+                                            
+                                                                                                            
+                                                                                                                             
+                                                                                                                     
+                                                                                                    
+                                                                        
+                                                                         
+                                                                           
+                                                                                                                                
+    
+         
+                                                                                                                                                
+                                                                 
+                                                                                                                                       
+  target_modules:
+    - linear_qkv
+    - linear_proj
+    - linear_fc1
+    - linear_fc2
+  
+                                                                                                                    
+                                                                                                               
+  exclude_modules: []
+
+                                                                                                                     
+  dropout_position: pre
+
+                                                                          
+  lora_A_init_method: xavier
+
+                                                                        
+  lora_B_init_method: zero
+
+                                                                                       
+  a2a_experimental: False
+
+                                                                                        
+  dtype: null
+
+                                                                         
+  adapter_path: null
+
+                                                                                                           
+                                                                                                                    
+                              
+  freeze_vision_model: True
+  freeze_vision_projection: True
+  freeze_language_model: True

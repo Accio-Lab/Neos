@@ -1,0 +1,133 @@
+                                                                       
+tokenizer: null
+
+                                                
+use_shm: False
+
+                                                       
+                                                                                  
+                                                      
+                                                                                        
+train_files: ~/data/rlhf/gsm8k/train.parquet
+
+                                                     
+val_files: ~/data/rlhf/gsm8k/test.parquet
+
+                                   
+                                                    
+                                                           
+train_max_samples: -1
+
+                                   
+                                                    
+                                                         
+val_max_samples: -1
+
+                                                                            
+prompt_key: prompt
+
+                                                                                     
+reward_fn_key: data_source
+
+                                                                        
+                                                      
+                                                  
+max_prompt_length: 512
+
+                                                                                           
+                                                    
+max_response_length: 512
+
+                                                                           
+train_batch_size: 1024
+
+                                                          
+gen_batch_size: null
+
+                                                 
+val_batch_size: null
+
+                                                 
+tool_config_path: ${oc.select:actor_rollout_ref.rollout.multi_turn.tool_config_path, null}
+
+                            
+function_tool_path: ${oc.select:actor_rollout_ref.rollout.multi_turn.function_tool_path, null}
+
+                                                                        
+                                                                             
+                                                                          
+return_raw_input_ids: False
+
+                                                                              
+return_raw_chat: True
+
+                                                       
+return_full_prompt: False
+
+                                                
+shuffle: True
+
+                                     
+seed: null
+
+                        
+dataloader_num_workers: 8
+
+                  
+image_patch_size: 14
+
+                                        
+validation_shuffle: False
+
+                                     
+filter_overlong_prompts: False
+
+                                                   
+                                                            
+                                                
+filter_overlong_prompts_workers: 1
+
+                                                                    
+                                                                  
+truncation: error
+
+                                                                                       
+image_key: images
+
+                                                                  
+video_key: videos
+
+                                                                  
+audio_key: audios
+
+                                                                                            
+trust_remote_code: False
+
+                                                                                                
+custom_cls:
+
+                                                                                                                          
+  path: null
+
+                                                            
+  name: null
+
+                                                                                                                
+return_multi_modal_inputs: True
+
+                                                              
+apply_chat_template_kwargs: {}
+
+                                                                                                                                         
+                                        
+continuous_token:
+
+                                                                 
+  enable: False
+
+                                                                                        
+                                                                                                                                
+  model_family: auto
+
+                                                             
+mm_processor_kwargs: {}

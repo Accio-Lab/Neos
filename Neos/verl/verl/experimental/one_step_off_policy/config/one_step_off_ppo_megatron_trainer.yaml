@@ -1,0 +1,31 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+                                                      
+rollout:
+                                       
+  nnodes: 1
+                           
+  n_gpus_per_node: 8
+
+                                                   
+actor_rollout_ref:
+  rollout:
+                                                                                   
+    free_cache_engine: False
+                                                                 
+    calculate_log_probs: True
+
+    checkpoint_engine:
+      backend: "nccl"
+
+                                                 
+                                                                             
+algorithm:
+  rollout_correction:
+    bypass_mode: True

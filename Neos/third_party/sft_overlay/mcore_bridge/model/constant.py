@@ -1,0 +1,46 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+class LLMModelType:
+    gpt = 'gpt'
+    gpt_oss = 'gpt_oss'
+
+    qwen3_next = 'qwen3_next'
+    olmoe = 'olmoe'
+    glm4 = 'glm4'
+    minimax_m2 = 'minimax_m2'
+    hy_v3 = 'hy_v3'
+    bailing_moe = 'bailing_moe'
+    bailing_hybrid = 'bailing_hybrid'
+    deepseek_v4 = 'deepseek_v4'
+    glm_moe_dsa = 'glm_moe_dsa'
+
+    qwen3_emb = 'qwen3_emb'
+
+
+class MLLMModelType:
+    qwen2_vl = 'qwen2_vl'
+    qwen2_5_vl = 'qwen2_5_vl'
+    qwen3_vl = 'qwen3_vl'
+    qwen2_5_omni = 'qwen2_5_omni'
+    qwen3_omni = 'qwen3_omni'
+    qwen3_asr = 'qwen3_asr'
+    qwen3_5 = 'qwen3_5'
+    ovis2_5 = 'ovis2_5'
+
+    internvl_chat = 'internvl_chat'
+    internvl = 'internvl'
+    glm4v = 'glm4v'
+    glm4v_moe = 'glm4v_moe'
+    kimi_vl = 'kimi_vl'
+    llama4 = 'llama4'
+    gemma4 = 'gemma4'
+    gemma4_unified = 'gemma4_unified'
+
+    kimi_k25 = 'kimi_k25'
+
+    llava_onevision1_5 = 'llava_onevision1_5'
+
+    minicpmv4_6 = 'minicpmv4_6'
+
+
+class ModelType(LLMModelType, MLLMModelType):
+    pass

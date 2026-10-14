@@ -1,0 +1,39 @@
+                               
+                                           
+                                                   
+                                                                      
+                                                      
+
+                                                         
+defaults:
+
+                         
+  - ../optim@optim: fsdp
+
+                      
+  - ../engine@fsdp: fsdp
+
+                                                                      
+  - critic
+
+                                                                                
+  - _self_
+
+                                                                                         
+_target_: verl.workers.config.FSDPCriticConfig
+
+                                                           
+strategy: fsdp
+
+                                                   
+forward_micro_batch_size: ${oc.select:.ppo_micro_batch_size,null}
+
+                                                    
+forward_micro_batch_size_per_gpu: ${oc.select:.ppo_micro_batch_size_per_gpu,null}
+
+                                                               
+                                                                     
+ulysses_sequence_parallel_size: 1
+
+                                      
+grad_clip: 1.0

@@ -1,0 +1,48 @@
+tools:
+  - class_name: neos.workflow.tools.TextSearchTool
+    config:
+      type: native
+      text_search_top_k: 10
+      text_search_snippet_chars: 500
+
+  - class_name: neos.workflow.tools.WebVisitTool
+    config:
+      type: native
+      web_visit_max_pages: 5
+      web_visit_page_chars: 20000
+      web_visit_max_image_refs: 15
+      mei_mode: vlm
+
+  - class_name: neos.workflow.tools.ImageSearchTool
+    config:
+      type: native
+      image_search_max_queries: 5
+      image_search_top_k: 5
+      mei_mode: vlm
+
+  - class_name: neos.workflow.tools.ReverseImageSearchTool
+    config:
+      type: native
+      reverse_max_images: 3
+      reverse_top_k: 5
+      mei_mode: vlm
+
+  - class_name: neos.workflow.tools.FetchImageTool
+    config:
+      type: native
+      fetch_max_images: 5
+      fetch_max_side: 2048
+      context_image_max_side: 1536
+      context_image_max_pixels: 786432
+      context_image_jpeg_quality: 85
+      context_image_max_aspect_ratio: 128
+
+  - class_name: neos.workflow.tools.CropImageTool
+    config:
+      type: native
+      crop_max_per_image: 5
+      crop_max_total: 10
+      context_image_max_side: 1536
+      context_image_max_pixels: 786432
+      context_image_jpeg_quality: 85
+      context_image_max_aspect_ratio: 128

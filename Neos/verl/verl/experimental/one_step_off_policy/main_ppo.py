@@ -1,0 +1,129 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Meituan Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
+"""
+
+import asyncio
+import os
+import socket
+
+import hydra
+import ray
+
+from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
+from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
+from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler, need_critic, need_reference_policy
+from verl.utils.config import validate_config
+from verl.utils.device import auto_set_device
+
+
+@ray.remote(num_cpus=10, max_concurrency=100)  
+class OneStepTaskRunner:
+    def run(self, config):
+        
+        from pprint import pprint
+
+        from omegaconf import OmegaConf
+
+        from verl.utils.fs import copy_to_local
+
+        print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+
+        pprint(OmegaConf.to_container(config, resolve=True))
+
+        OmegaConf.resolve(config)
+
+        role_worker_mapping, ray_worker_group_cls = create_role_worker_mapping(config)
+
+        
+        validate_config(
+            config=config,
+            use_reference_policy=need_reference_policy(config),
+            use_critic=need_critic(config),
+        )
+
+        
+        
+        local_path = copy_to_local(
+            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+        )
+
+        
+        from verl.utils import hf_processor, hf_tokenizer
+
+        trust_remote_code = config.data.get("trust_remote_code", False)
+        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+
+        resource_pool_manager = create_resource_pool_manager(config, role_worker_mapping.keys())
+
+        from verl.utils.dataset.rl_dataset import collate_fn
+
+        
+        train_dataset = create_rl_dataset(
+            config.data.train_files,
+            config.data,
+            tokenizer,
+            processor,
+            max_samples=config.data.get("train_max_samples", -1),
+        )
+        val_dataset = create_rl_dataset(
+            config.data.val_files, config.data, tokenizer, processor, max_samples=config.data.get("val_max_samples", -1)
+        )
+        train_sampler = create_rl_sampler(config.data, train_dataset)
+
+        
+        trainer = OneStepOffRayTrainer(
+            config=config,
+            tokenizer=tokenizer,
+            processor=processor,
+            role_worker_mapping=role_worker_mapping,
+            resource_pool_manager=resource_pool_manager,
+            ray_worker_group_cls=ray_worker_group_cls,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            collate_fn=collate_fn,
+            train_sampler=train_sampler,
+            device_name=config.trainer.device,
+        )
+        
+        trainer.init_workers()
+        
+        asyncio.run(trainer.fit())
+
+
+@hydra.main(config_path="config", config_name="one_step_off_ppo_trainer", version_base=None)
+def main(config):
+    from time import time
+
+    from verl.trainer.main_ppo import run_ppo
+
+    start_time = time()
+
+    
+    auto_set_device(config)
+
+    
+    config.actor_rollout_ref.rollout.nnodes = config.rollout.nnodes
+    config.actor_rollout_ref.rollout.n_gpus_per_node = config.rollout.n_gpus_per_node
+
+    run_ppo(config, task_runner_class=OneStepTaskRunner)
+    print(f"total time: {time() - start_time:.2f} seconds")
+
+
+if __name__ == "__main__":
+    main()

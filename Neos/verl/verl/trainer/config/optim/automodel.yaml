@@ -1,0 +1,56 @@
+                                     
+_target_: verl.workers.config.AutomodelOptimizerConfig
+
+optimizer: AdamW
+
+                                      
+optimizer_impl: torch.optim
+
+                                                                       
+lr: 1e-5
+
+                                                        
+lr_warmup_steps_ratio: 0.0
+
+                                            
+total_training_steps: -1
+
+              
+weight_decay: 0.01
+
+                                                             
+lr_warmup_steps: -1
+
+                          
+betas: [0.9, 0.999]
+
+                    
+clip_grad: 1.0
+
+                                                                  
+init_lr_ratio: 0.1
+
+                                                           
+min_lr_ratio: 0.01
+
+                                                                   
+                                                                
+lr_scheduler_type: cosine
+
+                                                                 
+wd_incr_style: constant
+
+                                                                 
+num_cycles: 0.5
+zero_indexed_step: true
+
+                         
+eps: 1e-8
+master_weights: false
+store_param_remainders: false
+exp_avg_dtype: null                       
+exp_avg_sq_dtype: null                    
+master_weight_dtype: null                 
+
+                                                              
+override_optimizer_config: {}

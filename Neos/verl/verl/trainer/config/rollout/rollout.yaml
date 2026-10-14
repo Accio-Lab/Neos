@@ -1,0 +1,486 @@
+                                     
+_target_: verl.workers.config.RolloutConfig
+
+                                                                                                        
+name: ???
+
+                            
+mode: async
+
+                                                                                                  
+nnodes: 0
+
+                                             
+n_gpus_per_node: ${oc.select:trainer.n_gpus_per_node,8}
+
+                                   
+temperature: 1.0
+
+                                                                  
+top_k: -1
+
+                                        
+top_p: 1
+
+                                                                    
+                                                                        
+full_determinism: false
+
+                                                                 
+                                                          
+seed: 42
+
+                                              
+                                             
+prompt_length: ${oc.select:data.max_prompt_length,512}
+
+                                                
+                                               
+response_length: ${oc.select:data.max_response_length,512}
+
+                  
+                                                                             
+dtype: bfloat16
+
+                                                                 
+gpu_memory_utilization: 0.5
+
+                                                                 
+ignore_eos: False
+
+                                                                   
+enforce_eager: False
+
+                                                                                     
+                                                                                
+                                                                                            
+                         
+cudagraph_capture_sizes: null
+
+                                                  
+free_cache_engine: True
+
+                                           
+tensor_model_parallel_size: 2
+
+                     
+data_parallel_size: 1
+
+                     
+                                                                                            
+                                                                   
+expert_parallel_size: 1
+
+                      
+pipeline_model_parallel_size: 1
+
+                                 
+max_num_batched_tokens: 8192
+
+                        
+max_model_len: null
+
+                         
+max_num_seqs: 1024
+
+                                                                                                                               
+enable_chunked_prefill: True
+
+                                                                                                                   
+enable_prefix_caching: True
+
+                                    
+logprobs_mode: processed_logprobs
+
+                                    
+scheduling_policy: fcfs
+
+                                                                          
+                                                                                       
+load_format: dummy
+
+                                                                                 
+layered_summon: False
+
+                                                                                                                                                    
+log_prob_micro_batch_size: null
+
+                                                                                               
+log_prob_micro_batch_size_per_gpu: null
+
+                                                                       
+                                                                               
+log_prob_use_dynamic_bsz: ${oc.select:actor_rollout_ref.actor.use_dynamic_bsz,false}
+
+                                           
+                                                                                         
+log_prob_max_token_len_per_gpu: ${oc.select:actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}
+
+                            
+disable_log_stats: True
+
+                
+                                                                        
+do_sample: True
+
+                                                           
+n: 1
+
+                                                                                                
+                                                                                                                      
+over_sample_rate: 0
+
+                                                               
+                                                           
+                                            
+multi_stage_wake_up: false
+
+                                                                                                                  
+engine_kwargs:
+
+                      
+  vllm: {}
+
+                        
+  sglang: {}
+
+                        
+  trtllm: {}
+
+                                             
+val_kwargs:
+
+                                                                                           
+  _target_: verl.workers.config.SamplingConfig
+
+                                      
+                                                                    
+  top_k: -1
+
+                                          
+  top_p: 1.0
+
+                                     
+  temperature: 0
+
+                                            
+  n: 1
+
+                                                                          
+  do_sample: False
+
+                         
+multi_turn:
+
+                                                                                           
+  _target_: verl.workers.config.MultiTurnConfig
+
+                                                                                    
+  enable: False
+
+                                               
+  max_assistant_turns: null
+
+                                                              
+                                                                                 
+                                       
+                                 
+  tool_config_path: null
+
+                                                                             
+                                                                        
+                                                                             
+                                                                        
+                                             
+                                 
+  function_tool_path: null
+
+                                               
+  max_user_turns: null
+
+                                              
+  max_parallel_calls: 1
+
+                               
+  max_tool_response_length: 256
+
+                                                       
+  tool_response_truncate_side: middle
+
+                                                                                                                                      
+                                                                                                                                                              
+                                                                                                                                                                      
+  use_inference_chat_template: False
+
+                                                                                                                      
+                                                                                                                                                                                      
+                                                                                                                                                                     
+                                                                                                                                  
+                                
+                                                
+                                                               
+                                                                                   
+  tokenization_sanity_check_mode: strict
+
+                                                                       
+  format: hermes
+
+                                             
+  num_repeat_rollouts: null
+
+                                                    
+                                                                                                                       
+calculate_log_probs: True
+
+                                                 
+agent:
+
+                                                                                           
+  _target_: verl.workers.config.AgentLoopConfig
+
+                                
+  num_workers: 8
+
+                                                                   
+  default_agent_loop: single_turn_agent
+
+                                                                                                          
+                                                                
+   
+                       
+                                                                      
+                                        
+                           
+                                                                                           
+                  
+                  
+  agent_loop_config_path: null
+
+                               
+  custom_async_server:
+
+                                                                                             
+    _target_: verl.workers.config.CustomAsyncServerConfig
+
+                                                    
+    path: null
+
+                                                                        
+    name: null
+
+                                                                     
+checkpoint_engine:
+
+                                             
+  _target_: verl.workers.config.CheckpointEngineConfig
+
+                                                          
+  backend: naive
+
+                                                                                                       
+                                                                                        
+                                                             
+                                                              
+                                                                     
+                                    
+                                                                                                
+                                                                            
+                                                                            
+                                                           
+                                                          
+                                            
+  update_weights_bucket_megabytes: 2048
+
+                                                                             
+  engine_kwargs: {}
+
+                                                                             
+                                                                            
+                                
+  custom_backend_module: null
+
+                    
+trace:
+
+                                                                                           
+  _target_: verl.workers.config.TraceConfig
+
+                                                      
+  project_name: ${oc.select:trainer.project_name,null}
+
+                                                            
+  experiment_name: ${oc.select:trainer.experiment_name,null}
+
+                                                 
+  backend: null
+
+                                                
+  token2text: False
+
+                                                                                 
+                                                                                      
+                                                                             
+                                                                                                 
+  max_samples_per_step_per_worker: null
+
+
+                                                             
+                                                                           
+skip_tokenizer_init: True
+
+                                                         
+                                                                     
+enable_rollout_routing_replay: False
+
+                                                                                 
+                      
+moe_load_balance_metrics_interval: 0
+
+
+                                                  
+profiler:
+
+                                                                                           
+  _target_: verl.utils.profiler.ProfilerConfig
+
+                                                                 
+                       
+  tool: ${oc.select:global_profiler.tool,null}
+
+                                     
+  enable: ${oc.select:actor_rollout_ref.actor.profiler.enable,false}
+
+                                 
+  all_ranks: ${oc.select:actor_rollout_ref.actor.profiler.all_ranks,false}
+
+                                                    
+  ranks: ${oc.select:actor_rollout_ref.actor.profiler.ranks,[]}
+
+                               
+  save_path: ${oc.select:global_profiler.save_path,null}
+
+                        
+  tool_config:
+
+                
+    npu:
+
+                                                                                               
+      _target_: verl.utils.profiler.config.NPUToolConfig
+
+                                         
+                                                        
+      contents: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.contents,[]}
+
+                                                                              
+      level: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.level,level0}
+
+                                                
+      analysis: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.analysis,false}
+
+                                                                                                             
+      discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.discrete,false}
+
+                                                                      
+                                                                                 
+      profile_token_start: null
+
+                                                                               
+                                                           
+      profile_token_end: null
+
+                           
+    torch:
+
+                                                                                               
+      _target_: verl.utils.profiler.config.TorchProfilerToolConfig
+
+                                         
+                                                 
+      contents: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.contents,[]}
+
+                                                                                                             
+      discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.discrete,false}
+
+                                                                      
+                                                                                 
+      profile_token_start: null
+
+                                                                               
+                                                           
+      profile_token_end: null
+
+
+                                       
+    precision_debugger:
+
+                                                                                               
+      _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
+
+                                   
+      config_path: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.precision_debugger.config_path,${oc.select:global_profiler.global_tool_config.precision_debugger.config_path,null}}
+
+                                                          
+      steps: null
+
+                      
+                                                                                     
+                                                       
+      stages: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.precision_debugger.stages,${oc.select:global_profiler.global_tool_config.precision_debugger.stages,null}}
+
+                                                           
+      strict: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.precision_debugger.strict,${oc.select:global_profiler.global_tool_config.precision_debugger.strict,False}}
+
+                                                      
+prometheus:
+
+                                                                                           
+  _target_: verl.workers.config.PrometheusConfig
+
+                                                    
+  enable: false
+
+                                                           
+  port: 9090
+
+                                         
+  file: /tmp/ray/session_latest/metrics/prometheus/prometheus.yml
+
+                                                                                    
+  served_model_name: ${oc.select:actor_rollout_ref.model.path,null}
+
+                                                                 
+quantization: null
+
+                                                                                      
+quantization_config_file: null
+
+                                              
+mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
+
+                                                          
+qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollout_ref.actor.megatron.qat,null}}
+
+                                                                                                
+disaggregation:
+
+                                        
+  enabled: False
+
+                                                                           
+  prefill_replicas: 1
+
+                              
+  decode_replicas: 1
+
+                                                                  
+  decode_tensor_model_parallel_size: null
+
+                                                               
+  transfer_backend: nixl
+
+                                                              
+  bootstrap_port: null
+
+                                                        
+  ib_device: null

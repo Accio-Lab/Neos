@@ -1,0 +1,35 @@
+                                     
+_target_: verl.workers.config.TorchtitanOptimizerConfig
+
+                
+name: AdamW
+
+               
+lr: 1e-3
+
+                       
+lr_warmup_steps_ratio: 0.0
+
+                      
+total_training_steps: -1
+
+              
+weight_decay: 0.01
+
+                 
+lr_warmup_steps: -1
+
+                          
+betas: [0.9, 0.999]
+
+               
+clip_grad: 1.0
+
+                            
+eps: 1e-8
+
+                                           
+decay_type: linear
+
+                                       
+min_lr_factor: 0.0

@@ -1,0 +1,64 @@
+_target_: verl.workers.config.McoreOptimizerConfig
+
+               
+lr: 1e-3
+
+                       
+lr_warmup_steps_ratio: 0.0
+
+                      
+total_training_steps: -1
+
+              
+weight_decay: 0.01
+
+                 
+lr_warmup_steps: -1
+
+                          
+betas: [0.9, 0.999]
+
+               
+clip_grad: 1.0
+
+                
+optimizer: adam
+
+                                                  
+lr_warmup_init: 0.0
+
+lr_decay_steps: null
+
+                                                        
+lr_decay_style: constant
+
+                                       
+min_lr: 0.0
+
+                                    
+weight_decay_incr_style: constant
+
+                                         
+lr_wsd_decay_style: exponential
+
+lr_wsd_decay_steps: null
+
+                                              
+use_checkpoint_opt_param_scheduler: False
+
+                                                                           
+                                                                            
+                                                                                
+use_precision_aware_optimizer: False
+
+                                                                                      
+                                                                          
+main_grads_dtype: fp32
+
+                                                                                             
+exp_avg_dtype: fp32
+
+                                                                                              
+exp_avg_sq_dtype: fp32
+
+override_optimizer_config: {}

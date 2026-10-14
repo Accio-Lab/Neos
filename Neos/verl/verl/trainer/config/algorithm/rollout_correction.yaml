@@ -1,0 +1,28 @@
+                                                             
+                                              
+                                                                                
+
+                                                                                       
+rollout_is: null
+
+                             
+                                              
+                                       
+rollout_is_threshold: 2.0
+
+                                                                                     
+rollout_rs: null
+
+                                                                   
+rollout_rs_threshold: null
+
+                                                                            
+bypass_mode: false
+
+                                              
+                                                                    
+                                                                     
+loss_type: ppo_clip
+
+                                                                               
+rollout_is_batch_normalize: false

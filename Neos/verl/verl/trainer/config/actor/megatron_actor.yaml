@@ -1,0 +1,39 @@
+                                                                        
+defaults:
+                             
+  - ../optim@optim: megatron
+
+                          
+  - ../engine@megatron: megatron
+
+  - actor
+
+                                                                                
+  - _self_
+
+_target_: verl.workers.config.McoreActorConfig
+
+strategy: megatron
+
+                                                                            
+                                                           
+checkpoint:
+
+                                           
+  _target_: verl.workers.config.McoreCheckpointConfig
+
+                             
+                                                                                                                      
+                                                    
+                                                                                                  
+                                                
+  mbridge_config: {}
+                                            
+entropy_from_logits_with_chunking: False
+
+                                                
+entropy_from_logits_chunk_size: 2048
+
+megatron:
+  entropy_from_logits_with_chunking: ${oc.select:actor_rollout_ref.actor.entropy_from_logits_with_chunking,False}
+  entropy_from_logits_chunk_size: ${oc.select:actor_rollout_ref.actor.entropy_from_logits_chunk_size,2048}

@@ -1,0 +1,53 @@
+                                     
+_target_: verl.workers.config.FSDPOptimizerConfig
+
+                                                                     
+optimizer: AdamW
+
+                                 
+                                                                
+optimizer_impl: torch.optim
+
+               
+lr: 1e-3
+
+                       
+lr_warmup_steps_ratio: 0.0
+
+                      
+total_training_steps: -1
+
+              
+weight_decay: 0.01
+
+                 
+lr_warmup_steps: -1
+
+                          
+betas: [0.9, 0.999]
+
+               
+clip_grad: 1.0
+
+                                      
+min_lr_ratio: 0.0
+
+                                        
+num_cycles: 0.5
+
+                                           
+lr_scheduler_type: constant
+
+                                              
+zero_indexed_step: true
+
+            
+warmup_style: null
+
+                                                 
+                                                    
+                               
+                   
+                            
+                               
+override_optimizer_config: null

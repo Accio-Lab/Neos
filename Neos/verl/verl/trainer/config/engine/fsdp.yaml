@@ -1,0 +1,94 @@
+                                     
+_target_: verl.workers.config.FSDPEngineConfig
+
+                               
+wrap_policy:
+
+                                                                      
+  min_num_params: 0
+
+                                                                      
+                                                        
+param_offload: false
+
+                                           
+                                                        
+optimizer_offload: false
+
+                                                           
+offload_policy: false
+
+                                                       
+                                                             
+reshard_after_forward: true
+
+                                                        
+fsdp_size: -1
+
+                                                                                
+                                         
+forward_prefetch: False
+
+                     
+model_dtype: fp32
+
+                                                                    
+use_orig_params: false
+
+                                  
+seed: 42
+
+                                                                                  
+full_determinism: false
+
+                                
+ulysses_sequence_parallel_size: 1
+
+                                                           
+entropy_from_logits_with_chunking: false
+
+                                                           
+entropy_from_logits_chunk_size: 2048
+
+                                       
+use_torch_compile: true
+
+                                               
+entropy_checkpointing: false
+
+                                      
+forward_only: false
+
+               
+strategy: fsdp
+
+                                      
+dtype: bfloat16                          
+
+                                                 
+qat:
+
+                                                                                           
+  _target_: verl.workers.config.QATEngineConfig
+
+                         
+  enable: false
+
+                                                                                         
+  mode: "w4a16"
+
+                                               
+  group_size: 16
+
+                                                    
+  ignore_patterns:
+
+    - "lm_head"
+    - "embed_tokens"
+    - "re:.*mlp.gate$"
+
+                                     
+  activation_observer: "static_minmax"
+
+                                              
+  quantization_config_path: null

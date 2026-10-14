@@ -1,0 +1,30 @@
+{
+    "name": "sglang",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "remoteUser": "devuser",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                                     
+                "ms-python.python",
+                "charliermarsh.ruff",
+                                   
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml"
+            ]
+        }
+    },
+    "forwardPorts": [],
+    "runArgs": [
+        "--gpus",
+        "all"
+    ],
+                                                                        
+                                                                       
+                                                                      
+                                                             
+    "workspaceMount": "source=${localWorkspaceFolder},target=/sgl-workspace/sglang,type=bind",
+    "workspaceFolder": "/sgl-workspace/sglang"
+}

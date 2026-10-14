@@ -1,0 +1,506 @@
+                               
+                                           
+                                                   
+                                                                      
+                                                      
+
+                                           
+defaults:
+
+  - model_engine: dp
+
+                                                             
+                                                               
+  - actor@actor_rollout_ref.actor: ${model_engine}_actor
+
+                                              
+  - data@data: legacy_data
+
+                           
+                                                                                                         
+  - ref@actor_rollout_ref.ref: ${model_engine}_ref
+
+                         
+  - rollout@actor_rollout_ref.rollout: rollout
+
+                 
+  - model@actor_rollout_ref.model: hf_model
+
+                        
+  - critic@critic: ${model_engine}_critic
+  - model@critic.model: hf_model
+
+                                                         
+  - legacy_reward_impl
+
+                  
+  - reward@reward: reward
+
+                              
+  - algorithm@algorithm.rollout_correction: rollout_correction
+
+                       
+  - distillation@distillation: distillation
+
+                                                                                
+                                       
+  - _self_
+
+                                               
+actor_rollout_ref:
+
+                                                                       
+  hybrid_engine: true
+
+                                                             
+  nccl_timeout: 600
+
+                          
+algorithm:
+
+                                                                                           
+  _target_: verl.trainer.config.AlgoConfig
+
+                                      
+  gamma: 1.0
+
+                                                            
+  lam: 1.0
+
+                                                                        
+  adv_estimator: gae
+
+                                                             
+  norm_adv_by_std_in_grpo: True
+
+                                                                         
+  filter_groups:
+
+                                                                                             
+    _target_: verl.trainer.config.FilterGroupsConfig
+
+                                       
+    enable: False
+
+                                                                                                            
+    metric: null
+
+                                                                                   
+    max_num_gen_batches: 0
+
+                                                                                            
+    max_inflight_gen_batches: 1
+
+                                          
+  use_kl_in_reward: False
+
+                                                                              
+  kl_penalty: kl
+
+                            
+  kl_ctrl:
+
+                                                                                             
+    _target_: verl.trainer.config.KLControlConfig
+
+                                            
+    type: fixed
+
+                                        
+    kl_coef: 0.001
+
+                                                        
+    horizon: 10000
+
+                                                         
+    target_kl: 0.1
+
+                                             
+  use_pf_ppo: False
+
+                                    
+  pf_ppo:
+
+                                                                       
+    reweight_method: pow
+
+                                                   
+    weight_pow: 2.0
+
+                        
+trainer:
+
+                                                             
+  balance_batch: True
+
+                                
+  total_epochs: 30
+
+                                                                       
+  total_training_steps: null
+
+                                                      
+  project_name: verl_examples
+
+                                                            
+  experiment_name: gsm8k
+
+                                                     
+  logger: ["console", "wandb"]
+
+                                                  
+  log_val_generations: 0
+
+                                                       
+  rollout_data_dir: null
+
+                                                          
+  validation_data_dir: null
+
+                                        
+  nnodes: 1
+
+                           
+  n_gpus_per_node: 8
+
+                                                       
+  save_freq: -1
+
+                                                                                                              
+                                                                                                                 
+                                                                                                                
+                                                                                                                                       
+                                                                                                            
+  esi_redundant_time: 0
+
+                                                    
+                                                    
+                                 
+                                                  
+  resume_mode: auto
+
+                                                                              
+  resume_from_path: null
+
+                                                    
+  val_before_train: True
+
+                                  
+  val_only: False
+
+                                                 
+  test_freq: -1
+
+                                                                     
+  critic_warmup: 0
+
+                                                                 
+  default_hdfs_dir: null
+
+                                                     
+  del_local_ckpt_after_load: False
+
+                                                  
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+
+                                               
+  max_actor_ckpt_to_keep: null
+
+                                                
+  max_critic_ckpt_to_keep: null
+
+                                                                
+  ray_wait_register_center_timeout: 300
+
+                                                   
+  device: cuda
+
+                             
+  use_v1: true
+
+                           
+  v1:
+
+                                                              
+    trainer_mode: sync
+
+                             
+    sync: {}
+
+                                                                 
+    colocate_async:
+
+                                                                   
+      num_warmup_batches: 1
+
+                                                                
+    separate_async:
+
+                                                                   
+      num_warmup_batches: 1
+
+                                                                          
+      parameter_sync_step: 4
+
+                                     
+    sampler:
+
+                                                                 
+      max_off_policy_threshold: 8
+
+                                                                                  
+                                 
+                                                                            
+      max_off_policy_strategy: drop
+
+                                                                             
+      sync_refill_failed_groups: False
+
+                             
+      custom_sampler:
+
+                                          
+        path: null
+
+                                          
+        name: null
+
+                                                
+      sampler_kwargs: {}
+
+                  
+global_profiler:
+
+                                                                                           
+  _target_: verl.utils.profiler.ProfilerConfig
+
+                                                                                     
+  tool: null
+
+                 
+  steps: null
+
+                                                          
+                                                                                   
+                                                          
+  profile_continuous_steps: False
+
+                                   
+  save_path: "outputs/profile"
+
+                                                                             
+  global_tool_config:
+
+                 
+    nsys:
+
+                                                                                               
+      _target_: verl.utils.profiler.config.NsightToolConfig
+
+                                                                                                             
+      discrete: False
+
+                                                                                          
+                                                                              
+                                                                                             
+      controller_nsight_options:
+
+                                         
+        trace: "cuda,nvtx,cublas,ucx"
+
+                                                                                            
+        cuda-memory-usage: "true"
+
+                                               
+        cuda-graph-trace: "graph"
+
+                                                                                      
+      worker_nsight_options:
+
+                                         
+        trace: "cuda,nvtx,cublas,ucx"
+
+                                                                                            
+        cuda-memory-usage: "true"
+
+                                               
+        cuda-graph-trace: "graph"
+
+                                                                                                     
+        capture-range: "cudaProfilerApi"
+
+                                                                 
+                                                                                     
+                                                       
+                                                                  
+                                                                                
+                                                                                            
+        capture-range-end: null
+
+                                                                                                      
+        kill: none
+
+                                                            
+    torch_memory:
+
+                                                       
+      trace_alloc_max_entries: 100_000
+
+                                                                  
+      stack_depth: 32
+
+                                                                                                                
+      context: "all"
+
+                                                                                                                         
+      stacks: "all"
+
+                                    
+      kw_args: {}
+
+                                
+    precision_debugger:
+
+                                                                                               
+      _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
+
+                                   
+      config_path: null
+
+                                                          
+      steps: null
+
+                      
+                                                                                     
+                                                       
+      stages: null
+
+                                                           
+      strict: False
+
+                                                                            
+transfer_queue:
+
+                                   
+  enable: False
+
+                                           
+  metrics:
+
+                                                                              
+                                                             
+    enabled: false
+
+                                                                       
+    port: 0
+
+                                                             
+  backend:
+
+                                                                                
+    storage_backend: SimpleStorage
+
+                                     
+                                                                         
+    SimpleStorage:
+
+                                                                             
+      total_storage_size: 100000
+
+                                            
+                                                                                   
+      num_data_storage_units: 8
+
+                                                                                  
+                                                        
+    MooncakeStore:
+
+                                                                                      
+                                                                                                       
+      auto_init: false
+
+                                                    
+      metadata_server: localhost:50123
+
+                                              
+      master_server_address: localhost:50124
+
+                                                           
+                                                     
+      local_hostname: localhost
+
+                                        
+      protocol: tcp
+
+                                                                                      
+      global_segment_size: 4294967296
+
+                                                                
+      local_buffer_size: 1073741824
+
+                                     
+                                                                  
+      device_name: ""
+
+                         
+skip:
+
+                                                                                           
+  _target_: verl.utils.skip.SkipManagerConfig
+
+                            
+  rollout:
+
+                                   
+    enable: False
+
+                                    
+    dump_dir: "~/.verl/rollout_dump"
+
+                           
+    steps: []
+
+                                                                                         
+    action: cache
+
+                                                              
+  rollout_tq:
+
+                                     
+    enable: False
+
+                                    
+    dump_dir: "~/.verl/rollout_dump"
+
+                           
+    steps: []
+
+                                                             
+    action: cache
+
+                                                     
+  async_rollout:
+
+                                        
+    enable: False
+
+                                    
+    dump_dir: "~/.verl/rollout_dump"
+
+                                                                   
+    steps: []
+
+                                                                                           
+    action: cache
+
+                        
+ray_kwargs:
+
+                                         
+  ray_init:
+
+                                                                                  
+    num_cpus: null
+
+                                                            
+  timeline_json_file: null

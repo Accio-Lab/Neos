@@ -1,0 +1,117 @@
+                                                                                
+           
+                                                                         
+                                                                              
+                           
+                                                                                
+
+
+                                        
+                           
+                                        
+[plugin.posix]
+                                                 
+ 
+                                 
+                             
+                                    
+                                         
+ 
+                                                                                                                                                 
+
+                                                                
+use_uring = "true"
+
+                                                    
+                        
+
+                    
+                  
+
+                                               
+active = true
+
+
+                                        
+                                        
+                                        
+[plugin.gds]
+                                            
+                                                         
+
+                                            
+batch_pool_size = 128
+
+                                                         
+batch_limit = 128
+
+                                                         
+max_request_size = 16777216         
+
+
+                                        
+                            
+                                        
+[plugin.gds_mt]
+                                           
+
+                                      
+thread_count = 4
+
+
+                                        
+                                       
+                                        
+[plugin.3fs]
+                               
+                                                      
+
+                                   
+mount_point = "/mnt/3fs"
+
+                            
+                       
+                                  
+                                 
+mem_config = "dram"
+
+                      
+                          
+iopool_size = 64
+
+
+                                        
+                                          
+                                        
+[plugin.obj]
+                                                       
+
+                                             
+num_threads = 4
+
+                                                    
+endpoint_override = ""
+
+                                                 
+scheme = "http"
+
+                              
+region = ""
+
+                            
+                       
+req_checksum = "required"
+
+                                   
+ca_bundle = ""
+
+             
+access_key = ""
+secrete_key = ""
+session_token = ""
+
+                                                                 
+use_virtual_addressing = "true"
+
+                     
+bucket = ""

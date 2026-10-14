@@ -1,0 +1,34 @@
+                              
+options:
+
+                                   
+  save_path: ./profiler_data
+
+                                                                        
+                                                                                                          
+                                           
+  roles: ["all"]
+
+                                                                          
+  level: level0
+
+                                      
+  with_memory: False
+
+                                   
+  record_shapes: False
+
+                                                   
+  with_npu: True
+
+                                                 
+  with_cpu: True
+
+                                                    
+  with_module: False
+
+                                                      
+  with_stack: False
+
+                                            
+  analysis: True

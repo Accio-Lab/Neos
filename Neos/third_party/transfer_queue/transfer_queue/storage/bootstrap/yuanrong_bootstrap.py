@@ -1,0 +1,455 @@
+# Copyright 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright 2025 The TransferQueue Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import os
+import shutil
+import subprocess
+from typing import Any
+
+import ray
+from omegaconf import DictConfig
+
+from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+from transfer_queue.utils.yuanrong_utils import get_local_ip_addresses, kill_actors_and_placement_group
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
+
+
+def _parse_remote_h2d_device_ids(worker_args: str) -> str | None:
+    """Parse --remote_h2d_device_ids parameter from worker_args string.
+
+    Args:
+        worker_args: Worker arguments string, e.g., "--arg1 value1 --remote_h2d_device_ids 0,1,2,3"
+
+    Returns:
+        The device IDs string if found and valid, None otherwise.
+
+    Raises:
+        RuntimeError: If --remote_h2d_device_ids flag is found but has invalid format.
+    """
+    if not worker_args:
+        return None
+
+    args_list = worker_args.split()
+
+    
+    try:
+        idx = args_list.index("--remote_h2d_device_ids")
+    except ValueError:
+        return None
+
+    
+    if idx + 1 >= len(args_list):
+        raise RuntimeError("--remote_h2d_device_ids flag found but no value provided")
+
+    device_ids = args_list[idx + 1]
+
+    
+    if not device_ids:
+        raise RuntimeError("Empty device IDs value after --remote_h2d_device_ids")
+
+    
+    parts = device_ids.split(",")
+    for part in parts:
+        if not part.isdigit():
+            raise RuntimeError(
+                f"Invalid device ID format: '{device_ids}'. Expected comma-separated digits (e.g., '0,1,2,3')."
+            )
+
+    return device_ids
+
+
+def start_datasystem_worker(
+    worker_address: str,
+    metastore_address: str,
+    is_head: bool,
+    worker_args: str = "",
+    enable_rdma: bool = False,
+    ucx_env_vars: dict | None = None,
+) -> None:
+    """Start Yuanrong datasystem worker in metastore mode.
+
+    Args:
+        worker_address: Worker address in format host:port
+        metastore_address: Metastore address in format host:port
+        is_head: Whether this node should start metastore service
+        worker_args: Additional arguments to append to dscli start command
+
+    Raises:
+        RuntimeError: If dscli command fails
+    """
+    if not shutil.which("dscli"):
+        raise RuntimeError("dscli executable not found in PATH. Please run `pip install openyuanrong-datasystem`.")
+
+    cmd = ["dscli", "start", "-w", "--worker_address", worker_address]
+    cmd.extend(["--metastore_address", metastore_address])
+    if is_head:
+        cmd.extend(["--start_metastore_service", "true"])
+
+    
+    cmd.extend(["--arena_per_tenant", "1", "--enable_worker_worker_batch_get", "true"])
+
+    
+    if worker_args:
+        cmd.extend(worker_args.split())
+
+    
+    if enable_rdma:
+        cmd.extend(["--enable_rdma", "true"])
+
+    node_type = "head node" if is_head else "worker node"
+    logger.info(f"Starting Yuanrong datasystem ({node_type}) at {worker_address}, worker_args={worker_args}")
+
+    
+    env = None
+    device_ids = _parse_remote_h2d_device_ids(worker_args)
+    if device_ids or enable_rdma or ucx_env_vars:
+        env = os.environ.copy()
+        if device_ids:
+            env["ASCEND_RT_VISIBLE_DEVICES"] = device_ids
+            logger.info(
+                f"Setting ASCEND_RT_VISIBLE_DEVICES={device_ids} for dscli subprocess ({node_type} at {worker_address})"
+            )
+        
+        if ucx_env_vars:
+            for key, value in ucx_env_vars.items():
+                env[key] = str(value)
+        
+        if enable_rdma and "UCX_TLS" not in env:
+            env["UCX_TLS"] = "rc_x"
+            logger.info(
+                f"Setting UCX_TLS=rc_x (default for RDMA) for dscli subprocess ({node_type} at {worker_address})"
+            )
+
+    try:
+        ds_result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=90,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as err:
+        raise RuntimeError(f"dscli start timed out: {err}") from err
+
+    if ds_result.returncode == 0 and "[  OK  ]" in ds_result.stdout:
+        logger.info(
+            f"dscli started Yuanrong datasystem ({node_type}, metastore mode) at {worker_address} successfully."
+        )
+    else:
+        raise RuntimeError(
+            f"Failed to start datasystem ({node_type}, metastore mode) at {worker_address}. "
+            f"Return code: {ds_result.returncode}, Output: {ds_result.stdout}"
+        )
+
+
+def stop_datasystem_worker(worker_address: str) -> None:
+    """Stop Yuanrong datasystem worker.
+
+    Args:
+        worker_address: Worker address in format host:port
+    """
+    if worker_address:
+        try:
+            result = subprocess.run(
+                ["dscli", "stop", "--worker_address", worker_address],
+                timeout=90,
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                logger.info(f"Stopped datasystem worker at {worker_address} via dscli stop")
+            else:
+                error_msg = (result.stderr or result.stdout or b"").decode()
+                logger.warning(
+                    f"Failed to stop datasystem worker at {worker_address}. "
+                    f"Return code: {result.returncode}, Error: {error_msg}"
+                )
+        except subprocess.TimeoutExpired as err:
+            logger.warning(f"dscli stop timed out for {worker_address}: {err}")
+        except Exception as e:
+            logger.warning(f"Failed to stop datasystem worker via dscli: {e}")
+
+
+@ray.remote(num_cpus=0.1)
+class YuanrongWorkerActor:
+    """Ray actor to manage Yuanrong datasystem worker on a node.
+
+    This actor runs on each node in the Ray cluster and is responsible for
+    starting and stopping the Yuanrong datasystem worker process on that node.
+
+    The actor determines its own rank and role (head or worker) by finding the
+    intersection of local IP addresses with the provided node IPs.
+    """
+
+    def __init__(
+        self,
+        node_ips: list[str],
+        worker_port: int,
+        metastore_port: int,
+        worker_args: str = "",
+        enable_rdma: bool = False,
+        ucx_env_vars: dict | None = None,
+    ):
+        """Initialize the Yuanrong worker actor.
+
+        Args:
+            node_ips: List of all node IPs in the Ray cluster
+            worker_port: Port for the datasystem worker
+            metastore_port: Port for the metastore service (on head node)
+            worker_args: Additional arguments to append to dscli start command
+
+        Raises:
+            RuntimeError: If cannot determine this node's IP from node_ips
+        """
+        local_ips = get_local_ip_addresses()
+        self.my_ip = None
+
+        
+        for ip in node_ips:
+            if ip in local_ips:
+                self.my_ip = ip
+                break
+
+        if self.my_ip is None:
+            raise RuntimeError(f"Cannot determine local node IP. Local IPs: {local_ips}, Cluster node IPs: {node_ips}")
+
+        self.node_ips = node_ips
+        self.worker_port = worker_port
+        self.metastore_port = metastore_port
+        self.worker_address = f"{self.my_ip}:{worker_port}"
+        self.worker_args = worker_args
+        self.enable_rdma = enable_rdma
+        self.ucx_env_vars = ucx_env_vars
+
+        
+        
+        self.head_node_ip = node_ips[0]
+        self.metastore_address = f"{self.head_node_ip}:{metastore_port}"
+        self.is_head = self.my_ip == self.head_node_ip
+
+        logger.info(
+            f"YuanrongWorkerActor initialized on node {self.my_ip}: "
+            f"worker_address={self.worker_address}, "
+            f"metastore_address={self.metastore_address}, is_head={self.is_head}, worker_args={self.worker_args}"
+        )
+
+    def start(self) -> str:
+        """Start the datasystem worker on this node.
+
+        Returns:
+            The worker address.
+
+        Raises:
+            RuntimeError: If dscli command fails
+        """
+        logger.info(f"Starting datasystem worker at {self.worker_address}...")
+        start_datasystem_worker(
+            self.worker_address,
+            metastore_address=self.metastore_address,
+            is_head=self.is_head,
+            worker_args=self.worker_args,
+            enable_rdma=self.enable_rdma,
+            ucx_env_vars=self.ucx_env_vars,
+        )
+        logger.info(f"Datasystem worker started successfully at {self.worker_address}")
+        return self.worker_address
+
+    def get_metastore_address(self) -> str:
+        """Get the metastore address.
+
+        Returns:
+            The metastore address in format host:port
+        """
+        return self.metastore_address
+
+    def get_node_ip(self) -> str:
+        """Return the IP address of the node this actor is running on."""
+        assert self.my_ip is not None
+        return self.my_ip
+
+    def stop(self) -> None:
+        """Stop the datasystem worker on this node."""
+        logger.info(f"Stopping datasystem worker at {self.worker_address}...")
+        stop_datasystem_worker(self.worker_address)
+        logger.info(f"Datasystem worker stopped successfully at {self.worker_address}")
+
+
+@StorageBootstrapProvider.register_provider("Yuanrong")
+def initialize_yuanrong_storage(conf: DictConfig) -> dict[str, Any] | None:
+    """Initialize Yuanrong storage with metastore mode.
+
+    This function sets up the Yuanrong storage datasystem workers across all Ray nodes
+    using placement groups and actors.
+
+    Args:
+        conf: Configuration containing Yuanrong storage settings
+
+    Returns:
+        Dict containing worker_actors, metastore_address, and placement_group
+
+    Raises:
+        RuntimeError: If Ray nodes not found or initialization fails
+    """
+    if not conf.backend.Yuanrong.auto_init:
+        return None
+
+    
+    nodes = ray.nodes()
+    if not nodes:
+        raise RuntimeError("No Ray nodes found. Is Ray initialized?")
+
+    
+    alive_nodes = [node for node in nodes if node.get("Alive", False)]
+    if not alive_nodes:
+        raise RuntimeError("No alive Ray nodes found")
+
+    
+    driver_ip = ray.util.get_node_ip_address()
+    head_node = None
+    other_nodes = []
+
+    
+    for node in alive_nodes:
+        node_ip = node["NodeManagerAddress"]
+        if node_ip == driver_ip:
+            head_node = node
+        else:
+            other_nodes.append(node)
+
+    if head_node is None:
+        raise RuntimeError(f"Driver node {driver_ip} not found in alive nodes")
+
+    
+    ordered_nodes = [head_node] + other_nodes
+
+    
+    node_ips = [node["NodeManagerAddress"] for node in ordered_nodes]
+    worker_port = conf.backend.Yuanrong.worker_port
+    metastore_port = conf.backend.Yuanrong.metastore_port
+    worker_args = conf.backend.Yuanrong.get("worker_args", "")
+    enable_rdma = conf.backend.Yuanrong.get("enable_rdma", False)
+    ucx_env_vars = dict(conf.backend.Yuanrong.get("ucx_env_vars", {}))
+
+    logger.info(f"Found {len(ordered_nodes)} alive Ray nodes: {node_ips}")
+
+    
+    bundles = [{"CPU": 0.1} for _ in ordered_nodes]
+
+    pg = ray.util.placement_group(bundles, strategy="STRICT_SPREAD")
+    try:
+        ray.get(pg.ready(), timeout=60)
+    except ray.exceptions.GetTimeoutError as e:
+        try:
+            ray.util.remove_placement_group(pg)
+        except Exception as cleanup_error:
+            logger.warning(f"Failed to remove placement group after readiness timeout: {cleanup_error}")
+        raise RuntimeError(
+            "Timed out waiting for Yuanrong placement group to become ready. "
+            f"Requested strategy=STRICT_SPREAD, bundles={bundles}. "
+            "This may be due to insufficient cluster capacity."
+        ) from e
+    except Exception as e:
+        try:
+            ray.util.remove_placement_group(pg)
+        except Exception as cleanup_error:
+            logger.warning(f"Failed to remove placement group after scheduling failure: {cleanup_error}")
+        raise RuntimeError(
+            f"Failed to create Yuanrong placement group. Requested strategy=STRICT_SPREAD, bundles={bundles}."
+        ) from e
+
+    logger.info(f"Created placement group with {len(bundles)} bundles using STRICT_SPREAD")
+
+    try:
+        
+        
+        
+        worker_actors = []
+        for rank in range(len(ordered_nodes)):
+            actor = YuanrongWorkerActor.options(  # type: ignore[attr-defined]
+                placement_group=pg,
+                placement_group_bundle_index=rank,
+            ).remote(node_ips, worker_port, metastore_port, worker_args, enable_rdma, ucx_env_vars)
+            worker_actors.append(actor)
+
+        logger.info(f"Created {len(worker_actors)} YuanrongWorkerActor instances")
+
+        
+        
+        head_actor_index = 0
+        for idx, actor in enumerate(worker_actors):
+            try:
+                node_ip = ray.get(actor.get_node_ip.remote())
+                if node_ip == driver_ip:
+                    head_actor_index = idx
+                    break
+            except Exception:
+                pass
+
+        logger.info(f"Head node actor identified: actor {head_actor_index}")
+
+        
+        logger.info("Starting head worker to initialize metastore...")
+        ray.get(worker_actors[head_actor_index].start.remote())
+        metastore_address = ray.get(worker_actors[head_actor_index].get_metastore_address.remote())
+        logger.info(f"Head worker started, metastore address: {metastore_address}")
+
+        
+        other_actors = [worker_actors[i] for i in range(len(worker_actors)) if i != head_actor_index]
+        if other_actors:
+            logger.info(f"Starting {len(other_actors)} worker actors in parallel...")
+            ray.get([actor.start.remote() for actor in other_actors])
+
+        logger.info(
+            f"Yuanrong backend started successfully: metastore at {metastore_address}, workers on {len(node_ips)} nodes"
+        )
+
+        return {
+            "worker_actors": worker_actors,
+            "metastore_address": metastore_address,
+            "placement_group": pg,
+            "head_actor_index": head_actor_index,
+        }
+    except Exception as e:
+        
+        logger.error(f"Failed to start Yuanrong workers: {e}, cleaning up...")
+
+        
+        
+        if worker_actors:
+            stop_exceptions = []
+            other_indices = [i for i in range(len(worker_actors)) if i != head_actor_index]
+            if other_indices:
+                stop_refs = [worker_actors[idx].stop.remote() for idx in other_indices]
+                for idx, stop_ref in zip(other_indices, stop_refs, strict=False):
+                    try:
+                        ray.get(stop_ref, timeout=30)
+                    except Exception as stop_e:
+                        stop_exceptions.append(stop_e)
+                        logger.warning(f"Failed to stop worker node actor {idx}: {stop_e}")
+            try:
+                ray.get(worker_actors[head_actor_index].stop.remote(), timeout=30)
+            except Exception as stop_e:
+                stop_exceptions.append(stop_e)
+                logger.warning(f"Failed to stop head node actor: {stop_e}")
+
+            if stop_exceptions:
+                logger.warning(f"Encountered {len(stop_exceptions)} errors during graceful worker stop")
+
+        
+        kill_actors_and_placement_group(worker_actors, pg)
+        raise

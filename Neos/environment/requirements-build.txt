@@ -1,0 +1,11 @@
+-c requirements-constraints.txt
+pip==26.0.1
+setuptools==80.10.2
+setuptools-scm==9.2.2
+wheel==0.46.3
+packaging==25.0
+ninja==1.13.0
+cmake==4.2.1
+pybind11==3.0.2
+psutil==7.2.2
+numpy==1.26.4

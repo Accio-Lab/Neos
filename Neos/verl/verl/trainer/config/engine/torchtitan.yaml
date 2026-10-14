@@ -1,0 +1,88 @@
+                                     
+_target_: verl.workers.config.TorchtitanEngineConfig
+
+                                            
+param_offload: False
+
+                                           
+optimizer_offload: False
+
+                               
+wrap_policy:
+                                                                      
+  min_num_params: 0
+
+                                                                      
+                                       
+reshard_after_forward: default
+
+                                                                                   
+forward_prefetch: false
+
+                                    
+use_orig_params: false
+
+                                        
+mixed_precision: false
+
+                              
+use_torch_compile: true
+
+                                                  
+entropy_from_logits_with_chunking: false
+
+                                                  
+entropy_from_logits_chunk_size: 2048
+
+                                      
+entropy_checkpointing: false
+
+                                      
+data_parallel_size: 1
+
+                              
+data_parallel_replicate_size: 1
+
+                          
+data_parallel_shard_size: 1
+
+                      
+tensor_parallel_size: 1
+
+                      
+expert_parallel_size: 1
+
+                        
+pipeline_parallel_size: 1
+
+                       
+context_parallel_size: 1
+
+                                                                        
+attn_type: flex
+
+                                                                     
+spmd_backend: spmd_types
+
+                                                                
+                                                                                
+                                                                          
+activation_checkpoint: selective
+
+                                                                                                          
+max_seq_len: null
+
+          
+strategy: torchtitan
+
+                                 
+seed: 42
+
+                                                                                 
+full_determinism: false
+
+                             
+forward_only: false
+
+                                      
+dtype: bfloat16

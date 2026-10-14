@@ -1,0 +1,6 @@
+                                                                                            
+                                                            
+defaults:
+  - ppo_trainer
+  - override model_engine: megatron
+  - _self_

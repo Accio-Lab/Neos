@@ -1,0 +1,252 @@
+
+
+import logging
+from typing import TYPE_CHECKING
+
+import torch
+import torch.distributed._functional_collectives as ft_c
+from torch.distributed.tensor.experimental._attention import _cp_options
+
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_group,
+    get_ulysses_parallel_world_size,
+)
+from sglang.srt.utils.common import torch_release
+
+_cp_options.enable_load_balance = False
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+        AttentionImpl,
+    )
+
+logger = logging.getLogger(__name__)
+
+
+def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    When tracing the code, the result tensor is not an AsyncCollectiveTensor,
+    so we cannot call ``wait()``.
+    """
+    if isinstance(tensor, ft_c.AsyncCollectiveTensor):
+        return tensor.wait()
+    return tensor
+
+
+def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
+    ulysses_pg = get_sp_group().ulysses_group
+    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+    x_shape = x.shape
+    x = x.flatten()
+    x = ft_c.all_to_all_single(
+        x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
+    )
+    x = _maybe_wait(x)
+    x = x.reshape(x_shape)
+    return x
+
+
+def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+    """
+    Perform Ulysses-style input all-to-all over the head dimension.
+
+    Default layout expects heads at dim=1 and sequence at dim=2:
+        [b, h, s_local, d] -> [b, h_local, s_global, d]
+
+    If heads are at dim=2 (input is [b, s_local, h, d]), set head_dim=2, and the
+    function returns [b, s_global, h_local, d], preserving the original
+    head/sequence dim ordering.
+
+    Args:
+        x: A 4D tensor with layout [b, *, *, d] where '*' are sequence and heads
+        head_dim: Which dimension index corresponds to heads (1 or 2)
+
+    Returns:
+        Tensor with the same dim order as input, with heads sharded and sequence gathered.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return x
+
+    assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
+    assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+
+    
+    if head_dim == 1:
+        b, h_global, s_local, d = x.shape
+        
+        permute_order = (1, 0, 2, 3)
+    else:  
+        b, s_local, h_global, d = x.shape
+        
+        permute_order = (2, 0, 1, 3)
+
+    assert (
+        h_global % world_size == 0
+    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+
+    h_local, s_global = h_global // world_size, s_local * world_size
+
+    x = x.permute(permute_order).contiguous()
+    x = _usp_all_to_all_single(x)
+    x = x.reshape(world_size, h_local, b, s_local, d)
+
+    
+    if head_dim == 1:
+        
+        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, h_local, s_global, d)
+    else:  
+        
+        x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, s_global, h_local, d)
+
+    return x
+
+
+def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+    """
+    Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
+
+    Default layout expects heads at dim=1 and sequence at dim=2:
+        [b, h_local, s, d] -> [b, h, s_local, d]
+
+    If heads are at dim=2 (input is [b, s_global, h // world_size, d]), set head_dim=2,
+    and the function returns [b, s_local, h, d], preserving the original head/sequence
+    dim ordering.
+
+    Args:
+        x: A 4D tensor with layout [b, *, *, d] where '*' are sequence and heads
+        head_dim: Which dimension index corresponds to heads (1 or 2)
+
+    Returns:
+        Tensor with the same dim order as input, with heads gathered and sequence sharded.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return x
+
+    assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
+    assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+
+    
+    if head_dim == 1:
+        b, h_local, s_global, d = x.shape
+        
+        permute_order = (2, 0, 1, 3)
+    else:  
+        b, s_global, h_local, d = x.shape
+        
+        permute_order = (1, 0, 2, 3)
+
+    assert (
+        s_global % world_size == 0
+    ), f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+
+    s_local, h_global = s_global // world_size, h_local * world_size
+
+    x = x.permute(permute_order).contiguous()
+    x = _usp_all_to_all_single(x)
+    x = x.reshape(world_size, s_local, b, h_local, d)
+
+    
+    if head_dim == 1:
+        
+        x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, h_global, s_local, d)
+    else:  
+        
+        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, s_local, h_global, d)
+
+    return x
+
+
+def ring_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_impl: "AttentionImpl",
+    is_causal: bool = False,
+    dropout_p: float = 0.0,
+):
+    """
+    Ring Attention implementation.
+
+    This function implements Ring Attention, a strategy for distributed attention
+    computation that reduces peak memory usage. It accepts a generic attention
+    implementation (`attn_impl`) which is called by the underlying PyTorch
+    distributed attention primitive.
+
+    Args:
+        query, key, value: The input tensors for attention.
+        attn_impl: An instance of an attention implementation backend
+                   (e.g., FlashAttentionImpl) whose `forward` method will be
+                   used as the computational kernel.
+        is_causal: Whether to apply causal masking.
+        dropout_p: Dropout probability.
+    """
+    
+    from torch.distributed.tensor.experimental._attention import (
+        _templated_ring_attention,
+    )
+
+    ring_pg = get_sp_group().ring_group
+    assert ring_pg is not None, "Ring process group is not initialized."
+
+    
+    
+    query = torch.permute(query, [0, 2, 1, 3]).contiguous()
+    key = torch.permute(key, [0, 2, 1, 3]).contiguous()
+    value = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
+    
+    
+    
+
+    
+    
+    def attn_callable_adapter(q, k, v, *args, **kwargs):
+        
+        
+        
+        
+        q = torch.permute(q, [0, 2, 1, 3])
+        k = torch.permute(k, [0, 2, 1, 3])
+        v = torch.permute(v, [0, 2, 1, 3])
+        
+        output, softmax_lse, *rest = attn_impl.forward(
+            q,
+            k,
+            v,
+            attn_metadata=None,
+            return_softmax_lse=True,
+        )
+        output = torch.permute(output, [0, 2, 1, 3])
+        return output, softmax_lse, *rest
+
+    
+    
+    use_segment_id = torch_release >= (2, 6)
+
+    attn_kwargs = dict(
+        op=attn_callable_adapter,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        query=query,
+        key=key,
+        value=value,
+        group=ring_pg,  
+    )
+
+    if use_segment_id:
+        
+        
+        out, *_ = _templated_ring_attention(
+            seq_dim=1,  
+            **attn_kwargs,
+        )
+    else:
+        out, *_ = _templated_ring_attention(
+            **attn_kwargs,
+        )
+
+    
+    output = torch.permute(out, [0, 2, 1, 3])
+    return output

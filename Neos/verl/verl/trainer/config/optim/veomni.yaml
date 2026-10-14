@@ -1,0 +1,39 @@
+                                     
+_target_: verl.workers.config.VeOmniOptimizerConfig
+
+optimizer: adamw
+
+               
+lr: 1e-3
+
+                       
+lr_min: 0.0
+
+                                   
+lr_start: 0.0
+
+                       
+lr_warmup_steps_ratio: 0.0
+
+                      
+lr_decay_ratio: 1.0
+
+                      
+total_training_steps: -1
+
+              
+weight_decay: 0.01
+
+                 
+lr_warmup_steps: -1
+
+                          
+betas: [0.9, 0.999]
+
+               
+clip_grad: 1.0
+
+                                           
+lr_scheduler_type: cosine
+
+override_optimizer_config: {}

@@ -1,0 +1,38 @@
+                                                         
+defaults:
+
+                              
+  - ../optim@optim: megatron
+
+                           
+  - ../engine@mindspeed:
+      - megatron
+      - mindspeed
+
+                                                                      
+  - critic
+
+                                                                                
+  - _self_
+
+                                                                                         
+_target_: verl.workers.config.MindSpeedCriticConfig
+
+strategy: mindspeed
+
+                                                                                                                                                     
+nccl_timeout: 600
+
+                      
+data_loader_seed: ${oc.select:actor_rollout_ref.actor.data_loader_seed,null}
+
+                                                                    
+                                                                  
+                                                                           
+checkpoint:
+
+                                           
+  _target_: verl.workers.config.MindSpeedCheckpointConfig
+
+                             
+  mbridge_config: {}

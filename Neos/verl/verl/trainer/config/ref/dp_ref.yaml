@@ -1,0 +1,42 @@
+                                                         
+defaults:
+
+                                                              
+  - ref
+  
+                      
+  - ../engine@fsdp_config: fsdp
+
+                                                                                
+  - _self_
+
+                                     
+_target_: verl.workers.config.FSDPActorConfig
+
+             
+fsdp_config:
+
+                             
+  forward_only: True
+
+                                              
+  entropy_from_logits_with_chunking: ${oc.select:actor_rollout_ref.ref.entropy_from_logits_with_chunking,False}
+
+                                                  
+  entropy_from_logits_chunk_size: ${oc.select:actor_rollout_ref.ref.entropy_from_logits_chunk_size,2048}
+
+                                
+  entropy_checkpointing: ${oc.select:actor_rollout_ref.ref.entropy_checkpointing,False}
+
+                        
+                                                                                          
+ulysses_sequence_parallel_size: ${oc.select:actor_rollout_ref.actor.ulysses_sequence_parallel_size,1}
+
+                                                       
+entropy_from_logits_with_chunking: False
+
+                                                  
+entropy_from_logits_chunk_size: 2048
+
+                   
+entropy_checkpointing: False

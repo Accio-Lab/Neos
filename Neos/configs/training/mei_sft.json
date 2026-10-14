@@ -1,0 +1,13 @@
+{
+  "name": "neos-mei-full-sft", "model": "", "model_type": "qwen3_5",
+  "dataset": "",
+  "validation": "",
+  "output": "", "nodes": 1, "gpus_per_node": 8,
+  "path_settings": {"model": "NEOS_BASE_MODEL_9B", "dataset": "NEOS_MEI_TRAIN_DATA", "validation": "NEOS_MEI_VALIDATION_DATA"},
+  "output_subdir": "sft/mei",
+  "tp": 2, "cp": 1, "pp": 1, "ep": 1, "etp": 1,
+  "micro_batch": 1, "global_batch": 64, "epochs": 2, "learning_rate": 3e-5, "min_lr": 1e-6,
+  "max_length": 32768, "padding_free": false, "group_by_length": true,
+  "optimizer_cpu_offload": false, "preserve_thinking": true, "freeze_router": false,
+  "eval_steps": 240, "targets": "judge-accepted visible JSON; no reasoning_content"
+}

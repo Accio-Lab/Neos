@@ -1,0 +1,2471 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import asyncio
+import concurrent
+import copy
+import functools
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+from torch.cuda.nvtx import range_pop, range_push
+
+from megatron.core import parallel_state
+from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.communication_utils import (
+    broadcast_from_last_pipeline_stage,
+    is_pipeline_last_stage,
+)
+from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
+from megatron.core.inference.contexts.static_context import StaticInferenceContext
+from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
+    AbstractModelInferenceWrapper,
+)
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import (
+    get_attention_mask,
+    set_decode_expert_padding,
+    set_moe_metadata_sync,
+)
+from megatron.core.models.multimodal.llava_model import LLaVAModel
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
+from megatron.core.transformer.moe.moe_layer import BaseMoELayer
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
+from megatron.core.transformer.utils import set_model_to_sequence_parallel
+from megatron.core.utils import (
+    accepts_parameter,
+    get_asyncio_loop,
+    get_model_config,
+    get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
+    round_up_to_nearest_multiple,
+    unwrap_model,
+)
+
+try:
+    import transformer_engine as te  
+
+    HAVE_TE = True
+
+except ImportError:
+    HAVE_TE = False
+
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
+from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
+from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
+    mamba_state_selective_copy,
+    prepare_next_forward_pass,
+    verify_speculative_tokens,
+)
+
+
+
+class TextGenerationController:
+    """The text generation controller (the main sampling loop)
+
+    This class tokenizes the input, runs inference, samples from logits, and detokenizes the output.
+
+    Args:
+        inference_wrapped_model (AbstractModelInferenceWrapper): A model that
+            is wrapped using the specs given in the abstract_model_inference_wrapper.py
+        tokenizer (_type_): Tokenizer used for tokenizing and detokenizing the prompts
+    """
+
+    def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
+        self.inference_wrapped_model = inference_wrapped_model
+        self.model_config = self.inference_wrapped_model.model.config
+        inference_config = self.inference_wrapped_model.inference_context.config
+        self.tokenizer = tokenizer
+        self.num_speculative_tokens = inference_config.num_speculative_tokens
+
+        pg_collection = inference_config.pg_collection
+        if pg_collection is not None:
+            self.pp_group = pg_collection.pp
+        else:
+            self.pp_group = parallel_state.get_pipeline_model_parallel_group()
+
+        self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
+
+        
+        
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        if isinstance(unwrapped_model, LLaVAModel):
+            self.vocab_size = unwrapped_model.language_model.vocab_size
+        else:
+            self.vocab_size = unwrapped_model.vocab_size
+
+        self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
+        self.num_mtp_heads = self._get_mtp_num_heads()
+        self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
+
+        if (
+            self.model_config.cuda_graph_impl == "local"
+            and self.model_config.expert_model_parallel_size > 1
+            and self.model_config.transformer_impl != "inference_optimized"
+        ):
+            assert self.model_config.moe_pad_experts_for_cuda_graph_inference, (
+                "--moe-pad-experts-for-cuda-graph-inference must be set when using "
+                "CUDA graphs with expert parallelism"
+            )
+
+        if self.inference_wrapped_model.inference_context.is_dynamic_batching():
+            self._init_dynamic_sampling_tensors()
+
+    def _get_mtp_num_heads(self) -> int:
+        """Get the number of MTP layers from the model config."""
+        model = self.inference_wrapped_model.model
+        if hasattr(model, 'config') and hasattr(model.config, 'mtp_num_layers'):
+            return model.config.mtp_num_layers or 0
+        return 0
+
+    def set_stop_word_finished_ids_callback(self, callback):
+        """Set a callback to get request IDs that should be marked as finished due to stop words.
+
+        The callback should have signature: callback(active_request_ids: List[int]) -> Set[int]
+        Returns a set of request IDs from active_request_ids that should be marked as finished.
+
+        Args:
+            callback: Function that returns request IDs to mark as finished.
+        """
+        self._get_stop_word_finished_ids_callback = callback
+
+    def _init_dynamic_sampling_tensors(self):
+        """Initialize tensors needed for dynamic sampling."""
+        context = self.inference_wrapped_model.inference_context
+        max_requests = context.max_requests
+        if context.config.materialize_only_last_token_logits:
+            
+            max_logits = max_requests * (self.num_speculative_tokens + 1)
+        else:
+            max_logits = context.max_tokens
+
+        
+        self._get_stop_word_finished_ids_callback = None
+
+        device = torch.cuda.current_device()
+        logits_dtype = self.inference_wrapped_model.config.params_dtype
+
+        self._sampling_backend = context.config.sampling_backend
+        self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
+
+        
+        if self._enable_cuda_graph:
+            self._all_logits_cuda = torch.zeros(
+                (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
+            )
+        else:
+            self._all_logits_cuda = None
+        
+        
+        
+        
+        
+        
+        self._sampled_tokens_cuda = None
+
+        
+        if self._sampling_backend == "flashinfer":
+            self._sampling: Sampling = FlashInferSampling(
+                self.vocab_size,
+                self.sampling_rng,
+                config=self.model_config,
+                enable_cuda_graph=self._enable_cuda_graph,
+            )
+        else:
+            self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
+
+        
+        self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        self._is_last_pp_stage = is_pipeline_last_stage(self.pp_group)
+        self._tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+        self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
+
+        self._init_mtp_sampling_tensors()
+
+    def _init_mtp_sampling_tensors(self):
+        """Pre-allocate MTP sampling tensors.
+
+        Addresses must be stable across steps for CUDA graph capture.
+        """
+        if not self.num_speculative_tokens:
+            self._sampled_mtp_tokens_cuda = None
+            self._accepted_tokens_per_request = None
+            self._last_accepted_seq_indices = None
+            return
+
+        context = self.inference_wrapped_model.inference_context
+        max_requests = context.max_requests
+        device = torch.cuda.current_device()
+        self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+        self._sampled_mtp_tokens_cuda = torch.empty(
+            [self.num_speculative_tokens, max_requests], dtype=torch.int64, device=device
+        )
+        self._accepted_tokens_per_request = (
+            torch.ones(
+                [max_requests, self.num_speculative_tokens], dtype=torch.int64, device=device
+            )
+            * -1
+        )
+        self._accepted_token_counts_per_request = torch.zeros(
+            max_requests, dtype=torch.int64, device=device
+        )
+        self._last_accepted_seq_indices_buf = torch.empty(
+            max_requests, dtype=torch.int64, device=device
+        )
+        self._last_accepted_seq_indices = None
+        self._num_mtp_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+        self._mtp_token_ids_buf = torch.empty([1, max_requests], dtype=torch.int64, device=device)
+        self._mtp_position_ids_buf = torch.empty(
+            [1, max_requests], dtype=torch.int64, device=device
+        )
+
+    @staticmethod
+    def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
+        """Utility to tokenize the input prompts.
+
+        Args:
+            tokenizer: The tokenizer to use.
+            prompt (str): The input prompt.
+            add_BOS (bool): Whether to add a BOS token.
+
+        Returns:
+            List[int]: Returns the tokenized prompt.
+        """
+
+        prompt_tokens = tokenizer.tokenize(prompt)
+
+        if add_BOS:
+            assert tokenizer.bos is not None
+
+        while prompt_tokens and prompt_tokens[0] == tokenizer.bos:
+            prompt_tokens.pop(0)
+
+        if add_BOS:
+            prompt_tokens = [tokenizer.bos] + prompt_tokens
+
+        return prompt_tokens
+
+    @staticmethod
+    def detokenize(
+        tokenizer, tokens: List[int], remove_EOD: bool = True, skip_special_tokens: bool = True
+    ) -> str:
+        """
+        Detokenize a sequence of token IDs, optionally removing trailing EOD
+        tokens and handling skip_special_tokens for different tokenizer APIs.
+
+        Args:
+            tokenizer: The tokenizer to use for detokenization.
+            tokens (List[int]): The token IDs to convert back to text.
+            remove_EOD (bool): Whether to remove trailing EOD tokens before
+                detokenization. Defaults to True.
+            skip_special_tokens (bool): Whether to remove special tokens (e.g. BOS/EOS)
+                during detokenization. Only passed through if the tokenizer supports it.
+
+        Returns:
+            str: The detokenized string.
+        """
+        if remove_EOD and getattr(tokenizer, "eod", None) is not None:
+            while tokens and tokens[-1] == tokenizer.eod:
+                tokens = tokens[:-1]
+
+        if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
+            return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
+        else:
+            return tokenizer.detokenize(tokens)
+
+    def detokenize_generations(
+        self,
+        tokens_gpu_tensor: torch.Tensor,
+        lengths_gpu_tensor: torch.Tensor,
+        detokenize_segments: bool,
+        skip_special_tokens: bool = True,
+    ) -> tuple[str, Optional[List[List[str]]]]:
+        """Detokenize the generated tokens.
+
+        Args:
+            tokens_gpu_tensor (torch.Tensor): Tensor containing the tokens
+            lengths_gpu_tensor (torch.Tensor): Tensor containing the lengths of each sequence
+            detokenize_segments (bool): If True, returns individually detokenized tokens. If False,
+            returns None as second element. Helpful for understanding per-token boundaries in
+            generated text.
+            skip_special_tokens (bool): If True removes special tokens like bos
+            during detokenization.
+
+        Returns:
+            tuple[str, List[str] | None]: A tuple containing:
+            - str: The complete detokenized text
+            - List[str] | None: List of segmented tokens if detokenize_segments is True, else None
+        """
+        
+
+        if not detokenize_segments:
+            tokens = tokens_gpu_tensor.tolist()
+            return (
+                self.detokenize(self.tokenizer, tokens, skip_special_tokens=skip_special_tokens),
+                None,
+            )
+
+        prompts_plus_generations: List[str] = []
+        prompts_plus_generations_segments: List[List[str]] = []
+        tokens_gpu_tensor = torch.unsqueeze(tokens_gpu_tensor, 0)
+        tokens = tokens_gpu_tensor.tolist()
+        lengths = lengths_gpu_tensor.tolist()
+
+        for sequence_tokens, length in zip(tokens, lengths):
+            sequence_tokens = sequence_tokens[:length]
+            detok_str = self.detokenize(self.tokenizer, sequence_tokens)
+            prompts_plus_generations.append(detok_str)
+            offsets = self.tokenizer.offsets(sequence_tokens, detok_str)
+            words = [
+                detok_str[start:end] for start, end in zip(offsets, offsets[1:] + [len(detok_str)])
+            ]
+
+            prompts_plus_generations_segments.append(words)
+
+        text = self.detokenize(self.tokenizer, tokens[0], skip_special_tokens=skip_special_tokens)
+
+        return text, prompts_plus_generations_segments
+
+    def sample_from_logits(
+        self,
+        last_token_logits: torch.Tensor,
+        sampling_params: Optional[SamplingParams] = None,
+        vocab_size: Optional[int] = None,
+        generation_started: Optional[torch.Tensor] = None,
+        top_n_logprobs_dict: Dict[int, List[Dict[str, float]]] = None,
+        logits: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Samples the logits to generate outputs
+
+        Given the logits of the last token, this function samples it
+        according to the parameters defined in sampling_params
+        and returns the samples. If sampling parameters top_n_logprobs > 0
+        at each step it also updates the top_n_logprobs dict.
+
+        Args:
+            last_token_logits (torch.Tensor): The last token logits. A tensor of
+                size [batch_size, vocab_size]
+            sampling_params (SamplingParams): The parameters to use for inference.
+            vocab_size (int): Obtained from the tokenizer. Defaults to None
+            generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True
+                            indicates the prompt at that index has started generating tokens.
+            top_n_logprobs_dict (top_n_logprobs_dict): The dict to be updated
+
+        Returns:
+            sampled_logits (torch.Tensor): 1D tensor with [batch_size] elements
+            top_n_logprobs_this_step (torch.return_types.topk): a topk tensor with values as logits
+                and indices as the top k elements. None if sampling params top_n_logprobs is 0.
+        """
+
+        if kwargs.get("common_inference_params"):
+            sampling_params = kwargs["common_inference_params"]
+
+        if sampling_params.top_n_logprobs > 0:
+            
+            
+            assert generation_started is not None
+            if logits is None:
+                batch_size = last_token_logits.shape[0]
+                last_token_log_probs = F.log_softmax(last_token_logits, dim=1).to(torch.float32)
+                top_n_logits_this_step = torch.topk(
+                    last_token_log_probs, k=sampling_params.top_n_logprobs
+                )
+                top_n_logprobs_this_step = top_n_logits_this_step.values.cpu()
+                top_n_logprobs_indices = top_n_logits_this_step.indices.cpu()
+
+                
+                
+                if sampling_params.skip_prompt_log_probs:
+                    mask = generation_started.cpu()
+                else:
+                    mask = torch.ones(batch_size, dtype=torch.bool)
+
+                self._update_top_n_logprobs_dict(
+                    top_n_logprobs_this_step, top_n_logprobs_indices, mask, top_n_logprobs_dict
+                )
+            else:
+                assert not sampling_params.skip_prompt_log_probs
+
+                
+                batch_size, seq_length, _ = logits.shape
+                log_probs = F.log_softmax(logits, dim=2).to(torch.float32)
+                top_n_logits_this_step = torch.topk(log_probs, k=sampling_params.top_n_logprobs)
+
+                
+                
+                top_n_logprobs_this_step = top_n_logits_this_step.values.permute(1, 0, 2).cpu()
+                top_n_logprobs_indices = top_n_logits_this_step.indices.permute(1, 0, 2).cpu()
+
+                
+                mask = torch.ones(batch_size, dtype=torch.bool)
+
+                for i in range(seq_length):
+                    self._update_top_n_logprobs_dict(
+                        top_n_logprobs_this_step[i],
+                        top_n_logprobs_indices[i],
+                        mask,
+                        top_n_logprobs_dict,
+                    )
+
+        top_p = sampling_params.top_p
+        top_k = sampling_params.top_k
+        temperature = sampling_params.temperature
+
+        return TorchSampling.sample_from_logits(
+            last_token_logits,
+            temperature,
+            top_k,
+            top_p,
+            generator=self.sampling_rng,
+            vocab_size=vocab_size,
+        )
+
+    def update_generation_status(
+        self,
+        updated_prompts_tokens: torch.Tensor,
+        generation_started: torch.Tensor,
+        current_context_end_position: int,
+        is_generation_done_tensor: torch.Tensor,
+        generated_sequence_lengths: torch.Tensor,
+        termination_id: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Checks which prompts have reached an end condition
+
+        We check which prompts have reached an end condition and set the corresponding
+        flags of the is_generation_done_tensor to True. The generated sequence lengths
+        increase as we keep generating, until that prompts hits an end condition. The
+        generation_started tensor determines which prompts have started generating.
+
+        Args:
+            updated_prompts_tokens (torch.Tensor): The prompts tokens updated with the latest
+                generated tokens. A tensor of shape [batch_size, max_seq_len]
+                (i.e max_seq_len = max_prompt_len + tokens_to_generate)
+            generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True
+                indicates the prompt at that index has started generating tokens.
+            current_context_end_position (int): An integer indicating which position to
+                extract from the prompts tokens to get the latest generated tokens.
+            is_generation_done_tensor (torch.Tensor): A boolean tensor of shape [batch_size].
+                True indicates the prompt at that index has reached end condition.
+            generated_sequence_lengths (torch.Tensor): A int tensor of shape [batch_size].
+                Each value represents the generated sequence lengths for that prompt.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Returns the boolean
+                is_generation_done_tensor and the generated_sequence_lengths after updating it
+        """
+        if termination_id is None:
+            termination_id = self.tokenizer.eod
+        latest_samples = updated_prompts_tokens[:, current_context_end_position]
+        
+        
+        reached_eod = (latest_samples == termination_id) & generation_started
+        is_generation_done_tensor = is_generation_done_tensor | reached_eod
+        
+        
+        generated_sequence_lengths += ~is_generation_done_tensor & generation_started
+
+        return is_generation_done_tensor, generated_sequence_lengths.int()
+
+    def pad_input_prompt_tokens(
+        self,
+        batch_prompt_tokens_list: List[List[int]],
+        padded_batch_size: int,
+        padded_sequence_length: int,
+    ) -> torch.Tensor:
+        """Method to pad input prompts
+
+        Given a list of prompts, pad them all to uniform length
+
+        Args:
+            batch_prompt_tokens_list (List[List[int]]): A list containing the prompt tokens
+            padded_batch_size (int): The maximum number of requests for this batch
+            padded_sequence_length (int): The maximum number of input + output tokens for this batch
+
+        Returns:
+            torch.Tensor: A torch tensor of shape [padded_batch_size, padded_sequence_length]
+        """
+        batch_size = len(batch_prompt_tokens_list)
+
+        
+        for prompt_tokens in batch_prompt_tokens_list:
+            padding_size = padded_sequence_length - len(prompt_tokens)
+            prompt_tokens.extend([self.tokenizer.eod] * padding_size)
+
+        
+        padded_prompt_tokens_list = batch_prompt_tokens_list
+        num_padded_requests = padded_batch_size - len(batch_prompt_tokens_list)
+        padded_prompt_tokens_list += [
+            [self.tokenizer.eod] * padded_sequence_length for _ in range(num_padded_requests)
+        ]
+
+        tokens = torch.tensor(padded_prompt_tokens_list, device=torch.cuda.current_device())
+
+        return tokens
+
+    def unpad_input_prompt_tokens(
+        self, padded_batch_prompt_tokens: torch.Tensor, original_batch_size: int
+    ):
+        """Truncates the given input tensor back to the original prompt size before padding.
+
+        Args:
+            padded_batch_prompt_tokens (torch.Tensor): The padded tokens tensor
+            original_batch_size (int): The original batch size before padding
+        """
+        return padded_batch_prompt_tokens[:original_batch_size]
+
+    def _dynamic_step_context_init(
+        self,
+        construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
+        is_dummy_forward: bool = False,
+    ):
+        """Initializes the inference context for dynamic batching.
+
+        Args:
+            construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use
+                for constructing the cuda graphs.
+            is_dummy_forward (bool): Whether we are running an expert parallel dummy forward pass
+
+        Return:
+            input_ids (Tensor): The active input IDs.
+            position_ids (Tensor): The active position IDs.
+        """
+        context = self.inference_wrapped_model.inference_context
+
+        
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        model_config = get_model_config(unwrapped_model)
+
+        
+        range_push("initialize_attention_state")
+        context.initialize_attention_state(
+            construct_graph_dimensions=construct_graph_dimensions,
+            is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
+        )
+        range_pop()
+
+        
+        range_push("transfer_bookkeeping_to_gpu")
+        context.transfer_bookkeeping_to_gpu()
+        range_pop()
+
+        set_moe_metadata_sync(unwrapped_model)
+
+        
+        
+        
+        if context.using_cuda_graph_this_step():
+            self._mtp_resolved_padded_count = context.padded_batch_dimensions.req_count
+            if self._sp_enabled:
+                self._mtp_resolved_padded_count = round_up_to_nearest_multiple(
+                    self._mtp_resolved_padded_count, self._tp_size
+                )
+        else:
+            self._mtp_resolved_padded_count = None
+
+        
+        
+        symmetric_ar_type = self.model_config.symmetric_ar_type
+        nccl_all_reduce_for_prefill = self.model_config.nccl_all_reduce_for_prefill
+        
+        moe_pad_experts_for_cuda_graph_inference = (
+            self.model_config.moe_pad_experts_for_cuda_graph_inference
+        )
+        is_inference_optimized = self.model_config.transformer_impl == "inference_optimized"
+        if is_inference_optimized:
+            assert not moe_pad_experts_for_cuda_graph_inference, (
+                "moe_pad_experts_for_cuda_graph_inference cannot be True when "
+                "transformer_impl is 'inference_optimized'"
+            )
+        if moe_pad_experts_for_cuda_graph_inference:
+            if context.using_cuda_graph_this_step():
+                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
+                set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
+            else:
+                set_decode_expert_padding(unwrapped_model, False)
+
+        if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
+            if context.is_decode_only():
+                
+                unwrapped_model.set_symmetric_ar(symmetric_ar_type)
+            else:
+                
+                unwrapped_model.set_symmetric_ar(None)
+
+        
+        
+        
+        if construct_graph_dimensions is not None and not is_dummy_forward:
+            return context.current_input_and_position_ids(
+                num_warmup_tokens=construct_graph_dimensions.token_count
+            )
+        else:
+            return context.current_input_and_position_ids()
+
+    def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor):
+        """Forward step the model to get logits for dynamic batching.
+
+        This also handles logits-broadcasting for pipeline parallelism.
+
+        Args:
+            input_ids (Tensor): The input token IDs.
+            position_ids (Tensor): The position IDs.
+        """
+        context = self.inference_wrapped_model.inference_context
+        if context.config.materialize_only_last_token_logits:
+            logits_seq_len = context.num_last_token_logits
+        else:
+            logits_seq_len = context.padded_active_token_count
+
+        with torch.inference_mode():
+            logits = self.inference_wrapped_model.run_one_forward_step(
+                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
+            )
+            
+
+        if not context.config.materialize_only_last_token_logits:
+            assert logits_seq_len == input_ids.shape[1]
+
+        
+        
+        
+        
+
+        if self.model_is_pipeline_parallel:
+            if context.config.materialize_only_last_token_logits:
+                logits_seq_len = context.num_last_token_logits
+            else:
+                logits_seq_len = input_ids.shape[1]
+            logits_shape = [1, logits_seq_len, self.vocab_size]
+
+            if is_pipeline_last_stage(self.pp_group):
+                assert logits is not None and torch.Size(logits_shape) == logits.shape
+
+            logits = broadcast_from_last_pipeline_stage(
+                logits_shape,
+                dtype=self.model_config.params_dtype,
+                tensor=logits,
+                pp_group=self.pp_group,
+            )
+
+        
+        if self._enable_cuda_graph:
+            self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits[:, :logits_seq_len, :])
+        else:
+            self._all_logits_cuda = logits
+
+    def _rewind_kv_cache(self) -> tuple:
+        """Update the KV cache bookkeeping for speculative decoding.
+
+        After forward pass with speculative tokens, some tokens may be rejected.
+        This function "rewinds" the KV cache bookkeeping to reflect only the
+        accepted tokens. The core bookkeeping rewind runs on CPU (mutating the
+        CPU source-of-truth tensors in place); the Mamba hybrid-model state
+        update stays on GPU because it operates on GPU-resident state buffers.
+
+        Returns (blocks_to_release, remove_mask) for the caller to release blocks
+        back to the allocator outside the compiled graph.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+
+        
+        
+        accepted_tokens_per_request_cpu = self._accepted_token_counts_per_request[
+            :active_request_count
+        ].cpu()
+
+        blocks_to_release, remove_mask = rewind_kv_cache(
+            accepted_counts=accepted_tokens_per_request_cpu,
+            prefill_status=context.request_in_prefill_status_tensor[active_request_slice],
+            last_kv_block_offset=context.request_last_kv_block_offset[active_request_slice],
+            kv_length_offsets=context.request_kv_length_offsets[active_request_slice],
+            kv_block_counts=context.request_kv_block_counts[active_request_slice],
+            last_kv_block_id=context.request_last_kv_block_id[active_request_slice],
+            kv_block_ids=context.request_to_kv_block_ids[active_request_slice],
+            num_speculative_tokens=self.num_speculative_tokens,
+            block_size_tokens=context.block_size_tokens,
+            num_active_requests=active_request_count,
+        )
+
+        
+        
+        if context.is_hybrid_model:
+            cuda_device = torch.cuda.current_device()
+            
+            
+            
+            prefill_status_gpu = context.gpu_view.request_in_prefill_status[:active_request_count]
+            accepted_counts_gpu = self._accepted_token_counts_per_request[:active_request_count]
+            mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
+                active_request_slice
+            ].to(cuda_device, non_blocking=True)
+            mamba_state_selective_copy(
+                intermediate_states=context.mamba_intermediate_conv_states,
+                current_states=context.mamba_conv_states,
+                prefill_status=prefill_status_gpu,
+                state_idx=mamba_state_idx,
+                accepted_counts=accepted_counts_gpu,
+                num_layers=context.num_mamba_layers,
+            )
+            mamba_state_selective_copy(
+                intermediate_states=context.mamba_intermediate_ssm_states,
+                current_states=context.mamba_ssm_states,
+                prefill_status=prefill_status_gpu,
+                state_idx=mamba_state_idx,
+                accepted_counts=accepted_counts_gpu,
+                num_layers=context.num_mamba_layers,
+            )
+
+        return blocks_to_release, remove_mask
+
+    def _sample_from_logits_2d(self, logits_2d: Tensor) -> Tensor:
+        """Sample tokens from 2D logits using existing sampling parameters.
+
+        Args:
+            logits_2d (Tensor): Logits of shape [num_requests, vocab_size].
+
+        Returns:
+            Tensor: Sampled tokens of shape [num_requests].
+        """
+        return self._sampling.sample_kernel(
+            logits_2d,
+            logits_2d.shape[0],
+            self.inference_wrapped_model.inference_context,
+            eager=True,
+        )
+
+    def _compute_serial_mtp_and_sample(self):
+        """Compute MTP logits serially after verification and sample speculative tokens.
+
+        This ensures that MTP predictions are always conditioned on verified tokens.
+        Each MTP depth receives the correctly sampled token from the previous depth
+        (or the base token for depth 0) rather than stale speculative tokens from
+        the previous step.
+
+        When sequence parallelism is active, hidden states are kept in SP format
+        (scattered along the first dimension) between MTP depths to avoid a
+        redundant gather + scatter round-trip per depth.
+        """
+        nvtx_range_push("mtp-spec-decoding/serial-mtp-init")
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+
+        unwrapped_model = self._unwrapped_model
+
+        
+        has_mtp = self._is_last_pp_stage and hasattr(
+            unwrapped_model, '_decoder_hidden_states_cache'
+        )
+
+        if has_mtp:
+            
+            hidden_states = unwrapped_model._decoder_hidden_states_cache
+
+            
+            
+            
+            if self._sp_enabled:
+                hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states, group=self.inference_wrapped_model.tp_group
+                )
+            last_accepted_hidden = hidden_states[self._last_accepted_seq_indices, :, :]
+            
+        else:
+            last_accepted_hidden = None
+
+        
+        
+        
+        
+        cuda_device = torch.cuda.current_device()
+        adjusted_offsets = context.request_kv_length_offsets[active_slice].to(
+            cuda_device, non_blocking=True
+        )
+        processed_tokens = context.request_query_lengths[active_slice].to(
+            cuda_device, non_blocking=True
+        )
+        
+        base_position = (adjusted_offsets + processed_tokens).to(torch.int64)
+
+        
+        next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
+        current_hidden = last_accepted_hidden if has_mtp else None
+
+        
+        if getattr(self, '_mtp_resolved_padded_count', None) is not None:
+            
+            padded_count = self._mtp_resolved_padded_count
+            assert not self._sp_enabled or padded_count % self._tp_size == 0
+        elif has_mtp:
+            
+            padded_count = active_request_count
+            if self._sp_enabled:
+                padded_count = round_up_to_nearest_multiple(padded_count, self._tp_size)
+        else:
+            padded_count = active_request_count
+        pad_count = padded_count - active_request_count
+
+        
+        if has_mtp:
+            current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
+            if self._sp_enabled:
+                current_hidden = scatter_to_sequence_parallel_region(
+                    current_hidden, group=self.inference_wrapped_model.tp_group
+                )
+
+        token_ids_buf = self._mtp_token_ids_buf[:, :padded_count]
+        position_ids_buf = self._mtp_position_ids_buf[:, :padded_count]
+
+        
+        token_ids_buf[0, active_request_count:] = 0
+        position_ids_buf[0, active_request_count:] = 0
+
+        nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
+        for depth in range(self._num_mtp_depths):
+            nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
+
+            token_ids_buf[0, :active_request_count] = next_token_ids
+            position_ids_buf[0, :active_request_count] = base_position + depth
+
+            mtp_logits_2d = None
+            if has_mtp:
+                nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/forward")
+                mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
+                current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
+                    hidden_states=current_hidden,
+                    next_token_ids=token_ids_buf,
+                    position_ids=position_ids_buf,
+                    depth=mtp_depth,
+                    eager=not context.using_cuda_graph_this_step(),
+                    cache_key=(
+                        ("mtp", padded_count, mtp_depth)
+                        if context.using_cuda_graph_this_step()
+                        else None
+                    ),
+                )
+                nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
+
+                
+                
+                mtp_logits = mtp_logits[:active_request_count]
+
+                
+                mtp_logits_2d = mtp_logits.squeeze(1)  
+
+            
+            if self.model_is_pipeline_parallel:
+                nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/pp-broadcast")
+                mtp_logits_2d = broadcast_from_last_pipeline_stage(
+                    [active_request_count, self.vocab_size],
+                    dtype=self.model_config.params_dtype,
+                    tensor=mtp_logits_2d,
+                    pp_group=self.pp_group,
+                )
+                nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/pp-broadcast")
+
+            
+            nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/sample")
+            spec_tokens = self._sample_from_logits_2d(mtp_logits_2d)
+            self._sampled_mtp_tokens_cuda[depth, :active_request_count] = spec_tokens
+            nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/sample")
+
+            
+            next_token_ids = spec_tokens
+            nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}")
+
+        
+        if has_mtp:
+            del unwrapped_model._decoder_hidden_states_cache
+
+    def _verify_speculative_tokens(
+        self,
+        output_tokens: Tensor,
+        input_tokens_required: Tensor,
+        num_decode_requests: int,
+        num_prefill_requests: int,
+        active_request_count: int,
+    ) -> tuple:
+        """Verify speculative tokens against input tokens (Triton kernel)."""
+        return verify_speculative_tokens(
+            input_tokens=input_tokens_required,
+            output_tokens=output_tokens,
+            num_decode_requests=num_decode_requests,
+            num_prefill_requests=num_prefill_requests,
+            num_speculative_tokens=self.num_speculative_tokens,
+        )
+
+    def _dynamic_step_sample_logits_and_verify_tokens(self, input_ids: Tensor):
+        """
+        Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        
+        
+        use_graph_for_sampling = (
+            self._sampling_backend == "flashinfer"
+            and self._enable_cuda_graph
+            and context.using_cuda_graph_this_step()
+        )
+        if use_graph_for_sampling:
+            sample_num_decode = context.padded_batch_dimensions.decode_req_count
+            sample_num_prefill = context.padded_batch_dimensions.prefill_req_count
+        else:
+            sample_num_decode = context.num_decode_requests
+            sample_num_prefill = context.num_prefill_requests
+
+        
+        
+        
+        
+        nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
+        
+        logits = self._all_logits_cuda
+        
+        
+        
+        
+        required_logit_indices = context.speculative_required_logit_indices()
+
+        if context.config.materialize_only_last_token_logits:
+            
+            sample_logits = logits.squeeze(0)
+            sample_gather_indices = None
+        else:
+            
+            
+            sample_logits = logits.squeeze(0)
+            sample_gather_indices = required_logit_indices
+        nvtx_range_pop("mtp-spec-decoding/verify/logit-indices")
+
+        
+        nvtx_range_push("mtp-spec-decoding/verify/sample")
+        output_tokens = self._sampling.sample_speculative(
+            sample_logits,
+            sample_num_decode,
+            sample_num_prefill,
+            self.num_speculative_tokens,
+            context,
+            gather_indices=sample_gather_indices,
+            eager=not use_graph_for_sampling,
+            cache_key=(
+                ("sample_speculative", sample_num_decode, sample_num_prefill)
+                if use_graph_for_sampling
+                else None
+            ),
+        )
+        nvtx_range_pop("mtp-spec-decoding/verify/sample")
+
+        num_prefill_requests = context.num_prefill_requests
+        num_decode_requests = active_request_count - num_prefill_requests
+
+        
+        nvtx_range_push("mtp-spec-decoding/verify/verify-tokens")
+        input_tokens_required = input_ids[0, required_logit_indices]
+        last_one_indices, accepted_tokens_mask, input_tokens_required = (
+            self._verify_speculative_tokens(
+                output_tokens,
+                input_tokens_required,
+                num_decode_requests,
+                num_prefill_requests,
+                active_request_count,
+            )
+        )
+        nvtx_range_pop("mtp-spec-decoding/verify/verify-tokens")
+
+        nvtx_range_push("mtp-spec-decoding/verify/prepare-next")
+        self._prepare_speculative_tokens_for_next_forward_pass(
+            num_decode_requests,
+            output_tokens,
+            required_logit_indices,
+            last_one_indices,
+            accepted_tokens_mask,
+            input_tokens_required,
+        )
+        nvtx_range_pop("mtp-spec-decoding/verify/prepare-next")
+
+    def _prepare_speculative_tokens_for_next_forward_pass(
+        self,
+        num_decode_requests: int,
+        output_tokens: torch.Tensor,
+        required_logit_indices: torch.Tensor,
+        last_one_indices: torch.Tensor,
+        accepted_tokens_mask: torch.Tensor,
+        input_tokens_required: torch.Tensor,
+    ):
+        """Prepare accepted speculative tokens for the next forward pass (Triton kernel).
+
+        Example:
+          input_tokens_required:  [ a5  a6s  a7s |  b3   b4s  b5s  |  c6  c7s  c8s  |  d2  |  e4  ]
+          Accepted tokens mask    [  1   1    0  |  1     1    1   |   1   0    0   |   1  |   1  ]
+          Accepted tokens         [ [a6s  -1] | [b4s  b5s] | [-1  -1] ]  (decode only; prefill → -1)
+          Accepted token counts   [     1     |      2     |     0    ]  (prefill defaults to 0)
+        """
+        active_request_count = last_one_indices.shape[0]
+        prepare_next_forward_pass(
+            num_decode_requests=num_decode_requests,
+            output_tokens=output_tokens,
+            required_logit_indices=required_logit_indices,
+            last_one_indices=last_one_indices,
+            accepted_tokens_mask=accepted_tokens_mask,
+            input_tokens=input_tokens_required,
+            sampled_tokens_buf=self._sampled_tokens_cuda,
+            last_accepted_seq_buf=self._last_accepted_seq_indices_buf,
+            accepted_tokens_per_request=self._accepted_tokens_per_request,
+            accepted_token_counts=self._accepted_token_counts_per_request,
+            num_speculative_tokens=self.num_speculative_tokens,
+        )
+        
+        self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
+
+    def _dynamic_step_sample_logits(self):
+        """Sample tokens from logits for dynamic batching."""
+        
+        
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        use_graph = (
+            self._sampling_backend == "flashinfer"
+            and self._enable_cuda_graph
+            and context.using_cuda_graph_this_step()
+        )
+        
+        n = context.padded_active_request_count if use_graph else active_request_count
+        
+        
+        
+        gather_indices = (
+            None
+            if context.config.materialize_only_last_token_logits
+            else context.gpu_view.active_request_last_token_idxs
+        )
+        self._sampled_tokens_cuda = self._sampling.sample_kernel(
+            self._all_logits_cuda.squeeze(0),
+            n,
+            context,
+            gather_indices=gather_indices,
+            eager=not use_graph,
+            cache_key=("sample", n) if use_graph else None,
+        )
+
+    def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
+        """Perform bookkeeping necessary to compute log probs for dynamic batching.
+
+        Returns:
+            return_log_probs (bool): Whether to return the sampled log_probs.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        return (
+            (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
+            (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
+        )
+
+    def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
+        """Collect flat routing indices for MoE router recording.
+
+        Retrieves recorded routing decisions via the context's routing_metadata
+        (which handles CUDA graph static buffers), performs the TP all-gather
+        when sequence parallelism is active, strips CUDA padding, and returns
+        a flat CPU numpy array aligned with the context's active-token layout.
+        Must be called while context attributes are still valid (before request
+        transitions).
+
+        Returns:
+            Optional[np.ndarray]: Flat routing array of shape
+                [active_token_count, num_layers, topk], or None if routing
+                replay is disabled or no routing data was recorded.
+        """
+        config = self.inference_wrapped_model.model.config
+        if not config.moe_enable_routing_replay:
+            return None
+
+        
+        context = self.inference_wrapped_model.inference_context
+        if context.moe_routing_metadata is None:
+            return None
+
+        stacked_routing = context.moe_routing_metadata.get_routing_indices()
+
+        if stacked_routing is None:
+            return None
+
+        active_token_count = context.active_token_count
+
+        
+        
+        
+        tp_group = self.inference_wrapped_model.tp_group
+        tp_size = get_pg_size(tp_group)
+
+        
+        if tp_size > 1 and get_model_config(self.inference_wrapped_model.model).sequence_parallel:
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            local_token_count = context.padded_active_token_count // tp_size
+
+            stacked_routing = stacked_routing[:local_token_count]
+            
+            
+            stacked_routing = gather_from_sequence_parallel_region(stacked_routing, group=tp_group)
+
+        
+        _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
+        return stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
+
+    def _dynamic_step_calculate_log_probs(self) -> Optional[Tensor]:
+        """Calculate log probs from logits."""
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        
+        assert self.num_speculative_tokens == 0
+        logits_seq_len = (
+            active_request_count
+            if context.config.materialize_only_last_token_logits
+            else context.padded_active_token_count
+        )
+
+        return context.calculate_log_probs(
+            self._all_logits_cuda[:, :logits_seq_len, :],
+            self._sampled_tokens_cuda[:active_request_count],
+            only_last_token_logits=context.config.materialize_only_last_token_logits,
+        )
+
+    def _dynamic_step_calculate_log_probs_speculative(self) -> Tuple[List[List[float]], Tensor]:
+        """Calculate log probs from logits for speculative decoding.
+
+        For decode requests, computes log probs for each accepted speculative token
+        and the newly sampled token using the main model logits. For prefill requests,
+        handles prompt log probs the same way as non-speculative decoding.
+
+        The main model logits at position j predict the token at position j+1. So:
+        - log_prob(accepted_token[j]) comes from logits at position j
+        - log_prob(newly_sampled_token) comes from logits at position accepted_count
+
+        Returns:
+            Tuple of (log_probs_list, log_probs_tensor):
+                log_probs_list: List of lists, one per active request, containing
+                    log probs for the tokens emitted in this step.
+                log_probs_tensor: Full log_softmax tensor for top-n computation.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        
+        request_in_prefill_status_tensor = context.gpu_view.request_in_prefill_status[
+            :active_request_count
+        ]
+        request_query_lengths = context.gpu_view.request_query_lengths[:active_request_count]
+
+        num_prefill_requests = request_in_prefill_status_tensor.sum().item()
+        num_decode_requests = active_request_count - num_prefill_requests
+
+        only_last = context.config.materialize_only_last_token_logits
+        
+        logits = self._all_logits_cuda
+        logits_squeezed = logits.squeeze(0).float()
+        if only_last:
+            log_probs_tensor = F.log_softmax(logits_squeezed, dim=-1)
+        else:
+            log_probs_tensor = F.log_softmax(logits_squeezed[: context.active_token_count], dim=-1)
+
+        log_probs_list_decode = []
+
+        if num_decode_requests > 0:
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+            decode_log_probs = log_probs_tensor[:decode_len].reshape(
+                num_decode_requests, self.num_speculative_tokens + 1, -1
+            )
+            accepted_counts = self._accepted_token_counts_per_request[:num_decode_requests]
+
+            
+            
+            
+            
+            gather_tokens = torch.zeros(
+                num_decode_requests,
+                self.num_speculative_tokens + 1,
+                device=logits.device,
+                dtype=torch.long,
+            )
+            gather_tokens[:, : self.num_speculative_tokens] = self._accepted_tokens_per_request[
+                :num_decode_requests
+            ].clamp(min=0)
+            gather_tokens[
+                torch.arange(num_decode_requests, device=logits.device), accepted_counts
+            ] = self._sampled_tokens_cuda[:num_decode_requests]
+
+            
+            gathered_log_probs = decode_log_probs.gather(2, gather_tokens.unsqueeze(-1)).squeeze(-1)
+
+            log_probs_list_decode = [
+                gathered_log_probs[i, : accepted_counts[i].item() + 1].tolist()
+                for i in range(num_decode_requests)
+            ]
+
+        log_probs_list_prefill = []
+        if num_prefill_requests > 0:
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+            prefill_log_probs = log_probs_tensor[decode_len:]
+
+            if only_last:
+                
+                prefill_new_tokens = self._sampled_tokens_cuda[
+                    num_decode_requests:active_request_count
+                ]
+                selected_log_probs = prefill_log_probs[
+                    torch.arange(num_prefill_requests, device=logits.device), prefill_new_tokens
+                ]
+                log_probs_list_prefill = [[lp.item()] for lp in selected_log_probs]
+            else:
+                prefill_token_ids = context.gpu_view.token_to_input_ids[
+                    decode_len : context.active_token_count
+                ].roll(-1, 0)
+                prefill_query_lengths = request_query_lengths[request_in_prefill_status_tensor == 1]
+                new_token_idx = prefill_query_lengths.cumsum(0) - 1
+                prefill_new_tokens = self._sampled_tokens_cuda[
+                    num_decode_requests:active_request_count
+                ]
+                prefill_token_ids[new_token_idx] = prefill_new_tokens
+
+                prefill_token_count = context.active_token_count - decode_len
+                seq_idx = torch.arange(prefill_token_count, device=logits.device)
+                selected_log_probs = prefill_log_probs[seq_idx, prefill_token_ids]
+
+                prefill_log_probs_split = selected_log_probs.cpu().split(
+                    prefill_query_lengths.tolist(), dim=0
+                )
+                log_probs_list_prefill = [lp.tolist() for lp in prefill_log_probs_split]
+
+        log_probs_list = log_probs_list_decode + log_probs_list_prefill
+
+        return log_probs_list, log_probs_tensor
+
+    def _dynamic_step_calculate_top_n_logprobs_speculative(
+        self, log_probs_tensor: Tensor
+    ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
+        """Calculate top-n log probs for speculative decoding.
+
+        For decode requests, computes top-n at each position that produced an
+        emitted token (accepted speculative positions + the newly sampled position).
+        For prefill requests, behaves identically to the non-speculative path.
+
+        Args:
+            log_probs_tensor (Tensor): Pre-computed log_softmax tensor from
+                _dynamic_step_calculate_log_probs_speculative.
+
+        Returns:
+            A dictionary mapping request_idx to list of (top_n_values, top_n_indices)
+            tuples, one per emitted token position.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        
+        request_in_prefill_status_tensor = context.gpu_view.request_in_prefill_status[
+            :active_request_count
+        ]
+        request_query_lengths = context.gpu_view.request_query_lengths[:active_request_count]
+
+        num_prefill_requests = request_in_prefill_status_tensor.sum().item()
+        num_decode_requests = active_request_count - num_prefill_requests
+
+        top_n_results = {}
+
+        if num_decode_requests > 0:
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+            decode_log_probs = log_probs_tensor[:decode_len].reshape(
+                num_decode_requests, self.num_speculative_tokens + 1, -1
+            )
+            accepted_counts = self._accepted_token_counts_per_request[:num_decode_requests]
+            top_n_per_request = context.active_request_metadata["top_n_logprobs"][
+                :num_decode_requests
+            ]
+            max_top_n = int(top_n_per_request.max().item())
+
+            if max_top_n > 0:
+
+                
+                topk_results = torch.topk(decode_log_probs, k=max_top_n, dim=-1)
+
+                
+                topk_values_cpu = topk_results.values.cpu()
+                topk_indices_cpu = topk_results.indices.cpu()
+
+                for i in range(num_decode_requests):
+                    top_n = int(top_n_per_request[i].item())
+                    if top_n > 0:
+                        num_valid = accepted_counts[i].item() + 1
+                        top_n_results[i] = [
+                            (topk_values_cpu[i, j, :top_n], topk_indices_cpu[i, j, :top_n])
+                            for j in range(num_valid)
+                        ]
+
+        if num_prefill_requests > 0:
+            only_last = context.config.materialize_only_last_token_logits
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+            prefill_log_probs = log_probs_tensor[decode_len:]
+
+            
+            prefill_top_n = context.active_request_metadata["top_n_logprobs"][
+                num_decode_requests:active_request_count
+            ].tolist()
+            max_top_n_prefill = int(max(prefill_top_n)) if prefill_top_n else 0
+
+            if max_top_n_prefill > 0:
+                if only_last:
+                    
+                    topk_results_prefill = torch.topk(
+                        prefill_log_probs, k=max_top_n_prefill, dim=-1
+                    )
+                    topk_vals_cpu = topk_results_prefill.values.cpu()
+                    topk_idxs_cpu = topk_results_prefill.indices.cpu()
+
+                    for i in range(num_prefill_requests):
+                        top_n = int(prefill_top_n[i])
+                        if top_n > 0:
+                            req_idx = num_decode_requests + i
+                            top_n_results[req_idx] = [
+                                (topk_vals_cpu[i, :top_n], topk_idxs_cpu[i, :top_n])
+                            ]
+                else:
+                    prefill_query_lengths = request_query_lengths[
+                        request_in_prefill_status_tensor == 1
+                    ]
+                    prefill_log_probs_per_request = prefill_log_probs.split(
+                        prefill_query_lengths.tolist(), dim=0
+                    )
+                    prefill_skip_prompt = context.active_request_metadata["skip_prompt_log_probs"][
+                        num_decode_requests:active_request_count
+                    ].tolist()
+
+                    for i in range(num_prefill_requests):
+                        top_n = int(prefill_top_n[i])
+                        if top_n > 0:
+                            req_idx = num_decode_requests + i
+                            request_lp = prefill_log_probs_per_request[i]
+                            skip_prompt = bool(prefill_skip_prompt[i])
+
+                            if skip_prompt and request_lp.size(0) > 1:
+                                top_n_logits = torch.topk(request_lp[-1], k=top_n)
+                                top_n_results[req_idx] = [
+                                    (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                                ]
+                            else:
+                                top_n_logits = torch.topk(request_lp, k=top_n, dim=-1)
+                                top_n_values_cpu = top_n_logits.values.cpu()
+                                top_n_indices_cpu = top_n_logits.indices.cpu()
+                                top_n_results[req_idx] = [
+                                    (top_n_values_cpu[t], top_n_indices_cpu[t])
+                                    for t in range(request_lp.size(0))
+                                ]
+
+        return top_n_results if top_n_results else None
+
+    def _dynamic_step_calculate_top_n_logprobs(
+        self, log_probs_tensor: Optional[Tensor] = None
+    ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
+        """Calculate top-n log probs from logits for dynamic batching.
+
+        Args:
+            log_probs_tensor (Optional[Tensor]): Pre-computed log probabilities tensor.
+                If provided, avoids recomputing log_softmax. Should be the tensor
+                returned by calculate_log_probs.
+
+        Returns:
+            A dictionary mapping request_idx to list of (top_n_logprobs, top_n_indices) tuples.
+            Each tuple in the list represents one token position.
+        """
+        assert log_probs_tensor is not None, (
+            "log_probs_tensor must be provided. This should be guaranteed by the calling code "
+            "computing log_probs when return_top_n_logprobs is True."
+        )
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+
+        
+        if context.config.materialize_only_last_token_logits or context.is_decode_only():
+            
+            
+            log_probs = log_probs_tensor[:active_request_count]
+
+            top_n_results = {}
+            for req_idx in range(active_request_count):
+                top_n = int(context.active_request_metadata["top_n_logprobs"][req_idx].item())
+                if top_n > 0:
+                    
+                    top_n_logits = torch.topk(log_probs[req_idx], k=top_n)
+                    top_n_results[req_idx] = [
+                        (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                    ]
+            return top_n_results if top_n_results else None
+
+        
+        
+        
+        log_probs = log_probs_tensor[: context.active_token_count]
+
+        active_query_lengths = context.request_query_lengths[active_request_slice]
+
+        
+        
+        log_probs_per_request = log_probs.split(active_query_lengths.tolist(), dim=0)
+
+        top_n_results = {}
+        for req_idx in range(active_request_count):
+            top_n = int(context.active_request_metadata["top_n_logprobs"][req_idx].item())
+            if top_n > 0:
+                request_log_probs = log_probs_per_request[
+                    req_idx
+                ]  
+                skip_prompt = bool(
+                    context.active_request_metadata["skip_prompt_log_probs"][req_idx].item()
+                )
+
+                
+                if skip_prompt and request_log_probs.size(0) > 1:
+                    
+                    top_n_logits = torch.topk(request_log_probs[-1], k=top_n)
+                    top_n_results[req_idx] = [
+                        (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                    ]
+                else:
+                    
+                    top_n_per_token = []
+                    for token_idx in range(request_log_probs.size(0)):
+                        top_n_logits = torch.topk(request_log_probs[token_idx], k=top_n)
+                        top_n_per_token.append(
+                            (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                        )
+                    top_n_results[req_idx] = top_n_per_token
+
+        return top_n_results if top_n_results else None
+
+    @torch.inference_mode()
+    def dummy_forward(self):
+        """Perform a dummy forward pass. This is used in expert model parallelism
+        on ranks that do not have any real requests. It may run in eager mode."""
+
+        context = self.inference_wrapped_model.inference_context
+
+        
+        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+        self._dynamic_step_forward_logits(input_ids, position_ids)
+
+        
+        
+        if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+            if not context.using_cuda_graph_this_step():
+                unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+                set_decode_expert_padding(unwrapped_model, False)
+
+        
+        
+        
+        
+        
+        self._dummy_serial_mtp_forward()
+
+        
+        context.reset()
+
+    @torch.inference_mode()
+    def _dummy_serial_mtp_forward(self):
+        """Run dummy MTP forward passes to participate in EP collectives.
+
+        When speculative decoding is active and MTP layers contain MoE sublayers
+        (inherited from the decoder layer spec), each serial MTP step triggers
+        EP all-to-all collectives. The dummy EP rank must issue matching
+        collective calls so the real ranks do not hang.
+
+        This mirrors the structure of ``_compute_serial_mtp_and_sample``:
+        - On the last PP stage (where MTP resides): run ``compute_mtp_single_step``
+          with dummy tensors so the MoE all-to-all is executed.
+        - When PP > 1: participate in the ``broadcast_from_last_pipeline_stage``
+          that the real ranks also perform.
+        """
+        if self.num_speculative_tokens == 0 or self.num_mtp_heads == 0:
+            return
+        if self.model_config.expert_model_parallel_size <= 1:
+            return
+
+        unwrapped_model = self._unwrapped_model
+
+        has_mtp = self._is_last_pp_stage and hasattr(
+            unwrapped_model, '_decoder_hidden_states_cache'
+        )
+        if not has_mtp and not self.model_is_pipeline_parallel:
+            
+            return
+
+        device = torch.cuda.current_device()
+        dtype = self.model_config.params_dtype
+        hidden_size = self.model_config.hidden_size
+
+        
+        
+        if getattr(self, '_mtp_resolved_padded_count', None) is not None:
+            padded_count = self._mtp_resolved_padded_count
+            assert not self._sp_enabled or padded_count % self._tp_size == 0
+        elif has_mtp:
+            
+            padded_count = self._tp_size if self._sp_enabled else 1
+
+        dummy_hidden = None
+        if has_mtp:
+            
+            
+            dummy_hidden = torch.zeros((padded_count, 1, hidden_size), device=device, dtype=dtype)
+            if self._sp_enabled:
+                dummy_hidden = scatter_to_sequence_parallel_region(
+                    dummy_hidden, group=self.inference_wrapped_model.tp_group
+                )
+            dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
+            dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
+
+        context = self.inference_wrapped_model.inference_context
+
+        for depth in range(self._num_mtp_depths):
+            nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
+            mtp_logits_2d = None
+            if has_mtp:
+                mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
+                dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
+                    hidden_states=dummy_hidden,
+                    next_token_ids=dummy_token_ids,
+                    position_ids=dummy_position_ids,
+                    depth=mtp_depth,
+                    eager=not context.using_cuda_graph_this_step(),
+                    cache_key=(
+                        ("mtp", padded_count, mtp_depth)
+                        if context.using_cuda_graph_this_step()
+                        else None
+                    ),
+                )
+                mtp_logits_2d = mtp_logits.squeeze(1)  
+
+            
+            if self.model_is_pipeline_parallel:
+                broadcast_from_last_pipeline_stage(
+                    [padded_count, self.vocab_size],
+                    dtype=dtype,
+                    tensor=mtp_logits_2d,
+                    pp_group=self.pp_group,
+                )
+            nvtx_range_pop(f"mtp-spec-decoding/dummy-depth-{depth}")
+
+    def _transfer_samples_to_cpu(self, active_request_count: int) -> tuple:
+        """Batch GPU-to-CPU transfer of sampled tokens.
+
+        Called at the boundary between GPU sampling and CPU bookkeeping.
+        After this returns, all sampled data is on CPU and the remainder
+        of the step is 100% CPU.
+
+        Returns:
+            tuple: (sampled_tokens_cpu, sampled_mtp_tokens_cpu) where
+                sampled_mtp_tokens_cpu is None when speculative decoding is off.
+        """
+        sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
+        if self.num_speculative_tokens > 0:
+            sampled_mtp_tokens_cpu = self._sampled_mtp_tokens_cuda[:, :active_request_count].cpu()
+        else:
+            sampled_mtp_tokens_cpu = None
+        return sampled_tokens_cpu, sampled_mtp_tokens_cpu
+
+    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+        """Update the dynamic inference context after sampling.
+
+        Args:
+            new_sample (Tensor): The newly sampled tokens.
+            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
+                that manage request metadata, such as sampling parameters. By default, this
+                metadata is retrieved from the context.
+
+        Return:
+            Dict [str, Tensor]: A dictionary containing:
+                active_request_ids (Tensor): Current active request IDs.
+                newly_paused_request_ids (Tensor): Newly paused request IDs.
+                finished_request_ids (Tensor): Finished request IDs.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+
+        
+        range_push("transfer_samples_to_cpu")
+        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
+            active_request_count
+        )
+        range_pop()
+
+        range_push("active_request_mask")
+        
+        active_request_ids = context.request_ids[active_request_slice].long()
+        active_sequence_lengths = context.get_active_sequence_lengths()
+
+        
+        
+        
+        
+        active_sequence_lengths += 1
+        max_sequence_lengths = context.get_max_sequence_lengths()
+
+        
+        
+        
+        active_request_mask = (
+            sampled_tokens_cpu
+            != context.active_request_metadata["termination_id"][:active_request_count]
+        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+
+        
+        
+        if self._get_stop_word_finished_ids_callback is not None:
+            request_ids_list = active_request_ids.tolist()
+            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+            if stop_word_finished_ids:
+                for idx, request_id in enumerate(request_ids_list):
+                    if request_id in stop_word_finished_ids:
+                        active_request_mask[idx] = 0
+
+        finished_idxs = (
+            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
+        )
+        finished_request_ids = context.request_ids[finished_idxs]
+
+        
+        
+        finished_routing_block_ids = {}
+        if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
+            for fidx in finished_idxs.tolist():
+                req_id = int(context.request_ids[fidx].item())
+                blocks = context.request_to_kv_block_ids[fidx]
+                valid = blocks[blocks >= 0].tolist()
+                if valid:
+                    finished_routing_block_ids[req_id] = valid
+
+        
+        
+        new_sample_copy = sampled_tokens_cpu.clone()
+        range_pop()
+
+        range_push("update_requests")
+        update_result = context.update_requests(
+            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
+        )
+        range_pop()
+
+        return {
+            "active_request_ids": active_request_ids,
+            "finished_request_ids": finished_request_ids,
+            
+            
+            
+            
+            "sample": sampled_tokens_cpu,
+            "finished_routing_block_ids": finished_routing_block_ids,
+            **(update_result or {}),
+        }
+
+    async def async_generate_output_tokens_dynamic_batch(
+        self, skip_bookkeeping: Optional[bool] = False
+    ) -> Optional[Dict]:
+        """Forward step the model and update the inference context.
+
+        Args:
+            skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+
+        Return:
+            (Optional[Dict]): A dictionary containing:
+                active_request_ids (Tensor): Current active request IDs.
+                newly_paused_request_ids (Tensor): Newly paused request IDs.
+                finished_request_ids (Tensor): Finished request IDs.
+                sample (Tensor): New sample.
+                log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
+                cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        
+        if context.active_token_count == 0 and active_request_count == 0:
+            return None
+
+        with torch.inference_mode():
+            input_ids, position_ids = self._dynamic_step_context_init()
+
+            cuda_graph_request_count = (
+                context.padded_active_request_count
+                if context.using_cuda_graph_this_step()
+                else None
+            )
+
+            
+            config = self.inference_wrapped_model.model.config
+            if config.moe_enable_routing_replay:
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+            
+            
+            range_push("forward_pass")
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+
+            
+            
+            
+            
+            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+                context.mamba_slot_allocator.commit_intermediate_states()
+
+            
+            
+            
+            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+            range_pop()
+
+        
+        
+        
+        
+        
+        
+        
+        await asyncio.sleep(0)
+
+        with torch.inference_mode():
+            range_push("sampling")
+            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+
+            if self.num_speculative_tokens > 0:
+                
+                nvtx_range_push("mtp-spec-decoding/verify")
+                self._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                nvtx_range_pop("mtp-spec-decoding/verify")
+                
+                nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
+                blocks_to_release, remove_mask = self._rewind_kv_cache()
+                nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
+
+                
+                
+                if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+                    if not context.using_cuda_graph_this_step():
+                        set_decode_expert_padding(self._unwrapped_model, False)
+
+                
+                nvtx_range_push("mtp-spec-decoding/serial-mtp")
+                self._compute_serial_mtp_and_sample()
+                nvtx_range_pop("mtp-spec-decoding/serial-mtp")
+
+                
+                
+                context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+            else:
+                self._dynamic_step_sample_logits()
+
+            log_probs = None
+            top_n_logprobs = None
+            if return_log_probs or return_top_n_logprobs:
+                if self.num_speculative_tokens > 0:
+                    log_probs, log_probs_tensor = (
+                        self._dynamic_step_calculate_log_probs_speculative()
+                    )
+                    if return_top_n_logprobs:
+                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
+                            log_probs_tensor
+                        )
+                else:
+                    log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs()
+                    if return_top_n_logprobs:
+                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
+                            log_probs_tensor
+                        )
+            range_pop()
+
+            if skip_bookkeeping:
+                
+                
+                
+                request_bookkeeping = {
+                    "sample": self._sampled_tokens_cuda[:active_request_count].cpu()
+                }
+            else:
+                
+                
+                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+
+            ret = {
+                "accepted_tokens": (
+                    
+                    self._accepted_tokens_per_request.clone()
+                    if self.num_speculative_tokens > 0
+                    else None
+                ),
+                "log_probs": log_probs,
+                "top_n_logprobs": top_n_logprobs,
+                "cuda_graph_request_count": cuda_graph_request_count,
+            }
+            if self.num_speculative_tokens > 0:
+                self._accepted_tokens_per_request.fill_(-1)
+                self._accepted_token_counts_per_request.fill_(0)
+            ret.update(request_bookkeeping)
+            return ret
+
+    @torch.inference_mode()
+    def generate_output_tokens_dynamic_batch(
+        self, loop: Optional[asyncio.AbstractEventLoop] = None
+    ) -> Optional[Dict]:
+        """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
+        loop = get_asyncio_loop(loop)
+        return loop.run_until_complete(self.async_generate_output_tokens_dynamic_batch())
+
+    def _update_top_n_logprobs_dict(
+        self,
+        top_n_logprobs_this_step: torch.Tensor,
+        top_n_logprobs_indices: torch.Tensor,
+        mask: torch.Tensor,
+        top_n_logprobs_dict: Dict[int, List[Dict[str, float]]],
+    ):
+        """Function to update the top_n_logprobs at each step
+
+        This function goes through the topn logprobs generated for each, and for whichever
+        batch has started generating tokens, it updates the top_n_logprobs_dict with the
+        decoded token (string) as the key and the logit as the value.
+        top_n_logprobs_dict has as keys the batch idx, the values is a list, where each element
+        represents a dictionary of decoded token as key and logit as value generated at each step
+
+        Args:
+            top_n_logprobs_this_step (torch.Tensor): The top n logprob values
+            top_n_logprobs_indices (torch.Tensor): The indices corresponding to the top n logprobs
+            mask (torch.Tensor): A mask to indicate which requests should append to the dict
+            top_n_logprobs_dict (top_n_logprobs_dict): The dict to be updated
+        """
+        for batch_idx, (logprob_values, logprob_indices) in enumerate(
+            zip(top_n_logprobs_this_step, top_n_logprobs_indices)
+        ):
+            if mask[batch_idx]:
+                logit_dict = {}
+                for logprob, logprob_index in zip(logprob_values, logprob_indices):
+                    key = self.tokenizer.detokenize([logprob_index.item()])
+                    logit_dict[key] = logprob.item()
+                top_n_logprobs_dict[batch_idx].append(logit_dict)
+
+    @torch.inference_mode()
+    def generate_all_output_tokens_static_batch(
+        self,
+        active_requests: OrderedDict[int, InferenceRequest],
+        active_streams: Optional[OrderedDict[str, AsyncStream]] = None,
+    ) -> OrderedDict[int, InferenceRequest]:
+        """Utility to generate all the output tokens and probabilities for the prompts.
+
+        This utility generates the output tokens for a static batch. It runs the forward steps till
+        all prompts complete generation, updates the status of these requests to completed, adds
+        the generated result and returns these requests
+
+        Args:
+            active_requests (OrderedDict[int, InferenceRequest]): The input active requests.
+
+        Returns:
+            OrderedDict[int, InferenceRequest]: The result for each of the incoming requests
+        """
+        assert all(request.prompt_tokens is not None for request in active_requests.values())
+
+        
+        batch_prompt_tokens_list: List[List[int]] = list(
+            map(
+                lambda request: copy.deepcopy(request.prompt_tokens),  # type: ignore[arg-type]
+                active_requests.values(),
+            )
+        )
+        prompt_lengths_in_batch = torch.tensor(
+            [len(prompt_tokens) for prompt_tokens in batch_prompt_tokens_list],
+            device=torch.cuda.current_device(),
+        )
+        max_prompt_length_in_batch = max(prompt_lengths_in_batch)
+        min_prompt_length_in_batch = min(prompt_lengths_in_batch)
+
+        
+        sampling_params: SamplingParams = list(active_requests.values())[0].sampling_params
+
+        
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        model_config = get_model_config(unwrapped_model)
+
+        
+        
+        use_attention_mask = (
+            sampling_params.num_tokens_to_generate == 0
+            and min_prompt_length_in_batch != max_prompt_length_in_batch
+        )
+
+        
+        enable_cuda_graph = model_config.cuda_graph_impl == "local"
+
+        
+        batch_size = len(active_requests)
+        max_sequence_length = max_prompt_length_in_batch + sampling_params.num_tokens_to_generate
+        context = self.inference_wrapped_model.inference_context
+        assert isinstance(context, StaticInferenceContext)
+        inference_max_batch_size = context.max_batch_size
+        inference_max_sequence_length = context.max_sequence_length
+        padded_batch_size = inference_max_batch_size if enable_cuda_graph else batch_size
+        if padded_batch_size > inference_max_batch_size:
+            raise ValueError(
+                f"Padded batch size {padded_batch_size} > max batch size {inference_max_batch_size}"
+            )
+        padded_batch_prompt_tokens = self.pad_input_prompt_tokens(
+            batch_prompt_tokens_list,
+            padded_batch_size=padded_batch_size,
+            padded_sequence_length=max_sequence_length,
+        )
+
+        
+        if max_sequence_length > inference_max_sequence_length:
+            raise MaxSequenceLengthOverflowError(
+                f"Maximum allowed sequence length was set to {inference_max_sequence_length} "
+                f"tokens but requested generation of {max_sequence_length} tokens"
+            )
+
+        top_n_logprobs_dict = defaultdict(list)
+
+        
+        output_log_probs = None
+        if sampling_params.return_log_probs:
+            output_log_probs = torch.empty(
+                (batch_size, max_sequence_length - 1),
+                dtype=torch.float32,
+                device=torch.cuda.current_device(),
+            )
+
+        
+        is_generation_done_tensor = torch.zeros(
+            batch_size, dtype=torch.bool, device=torch.cuda.current_device()
+        )
+
+        
+        generated_sequence_lengths = torch.zeros(
+            batch_size, device=torch.cuda.current_device()
+        ).cuda()
+
+        
+        no_early_termination = getattr(sampling_params, "no_early_termination", False)
+        termination_id = -1 if no_early_termination else self.tokenizer.eod
+
+        streaming_enabled = active_streams is not None and len(active_streams) > 0
+        if streaming_enabled:
+            
+            
+            streaming_idx: List[int] = [
+                i
+                for (i, request_id) in enumerate(active_requests.keys())
+                if request_id in active_streams
+            ]
+            streaming_request_ids: List[int] = list(active_streams.keys())
+            streams: List[AsyncStream] = list(active_streams.values())
+            streaming_requests: List[InferenceRequest] = [
+                active_requests[request_id] for request_id in streaming_request_ids
+            ]
+            streaming_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            stream_tokens = functools.partial(self.stream_tokens, sampling_params)
+
+        for request in active_requests.values():
+            
+            request.tpot = []
+        timing_events = []
+
+        with torch.inference_mode():
+            self.inference_wrapped_model.prep_model_for_inference()
+
+            inference_input: Dict[str, Any] = self.prep_inference_input(
+                prompts_tokens=padded_batch_prompt_tokens,
+                active_requests=active_requests,
+                use_attention_mask=use_attention_mask,
+            )
+
+            assert (
+                not self.inference_wrapped_model.inference_context.is_decode_only()
+            ), f"Generation must start in prefill mode"
+
+            
+            
+            
+            
+            
+            
+            
+            tp_size = model_config.tensor_model_parallel_size
+            ep_size = model_config.expert_model_parallel_size
+            model_is_tp_ep = tp_size > 1 and ep_size > 1
+            if model_is_tp_ep:
+                set_model_to_sequence_parallel(
+                    unwrapped_model, False, exclude_modules=[BaseMoELayer]
+                )
+            elif model_config.sequence_parallel and (ep_size == 1 or tp_size == 1):
+                raise NotImplementedError(
+                    f"Sequence parallellism is only supported for static batching with MoE models"
+                )
+
+            
+            
+            symmetric_ar_type = self.model_config.symmetric_ar_type
+            nccl_all_reduce_for_prefill = self.model_config.nccl_all_reduce_for_prefill
+            if symmetric_ar_type is not None and nccl_all_reduce_for_prefill:
+                unwrapped_model.set_symmetric_ar(None)
+
+            
+            moe_pad_experts_for_cuda_graph_inference = (
+                self.model_config.moe_pad_experts_for_cuda_graph_inference
+            )
+            if moe_pad_experts_for_cuda_graph_inference:
+                set_decode_expert_padding(unwrapped_model, False)
+
+            context_start_position = 0
+
+            
+            
+            if sampling_params.num_tokens_to_generate == 0:
+                context_end_position = max_prompt_length_in_batch
+            else:
+                context_end_position = min_prompt_length_in_batch
+
+            
+            
+            
+            
+            
+            
+            while True:
+                
+                
+                timing_events.append(torch.cuda.Event(enable_timing=True))
+                timing_events[-1].record()
+
+                
+                inference_input_for_context_window: Dict[str, Any] = (
+                    self.inference_wrapped_model.get_batch_for_context_window(
+                        inference_input, context_start_position, context_end_position
+                    )
+                )
+
+                
+                if (
+                    enable_cuda_graph
+                    and self.inference_wrapped_model.inference_context.is_decode_only()
+                    and "attention_mask" in inference_input_for_context_window
+                ):
+                    inference_input_for_context_window["attention_mask"] = None
+                elif use_attention_mask:
+                    assert (
+                        attention_mask := inference_input_for_context_window.get(
+                            "attention_mask", None
+                        )
+                        is not None
+                    )
+
+                
+                materialize_only_last_token_logits = (
+                    self.inference_wrapped_model.inference_context.is_decode_only()
+                    or not (sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0)
+                )
+                inference_context = self.inference_wrapped_model.inference_context
+                inference_context.config.materialize_only_last_token_logits = (
+                    materialize_only_last_token_logits
+                )
+
+                
+                
+                logits = self.inference_wrapped_model.run_one_forward_step(
+                    inference_input_for_context_window
+                )
+
+                
+                batch_prompt_tokens = self.unpad_input_prompt_tokens(
+                    padded_batch_prompt_tokens, batch_size
+                )
+                assert batch_prompt_tokens.shape[0] == batch_size, batch_prompt_tokens.shape[0]
+                if is_pipeline_last_stage(self.pp_group):
+                    logits = logits[:batch_size]
+
+                if self.model_is_pipeline_parallel:
+                    context_length = context_end_position - context_start_position
+                    logits_seq_len = 1 if materialize_only_last_token_logits else context_length
+                    logits_shape = [batch_size, logits_seq_len, self.vocab_size]
+                    if is_pipeline_last_stage(self.pp_group):
+                        assert logits is not None and torch.Size(logits_shape) == logits.shape
+                    
+                    
+                    logits = broadcast_from_last_pipeline_stage(
+                        [batch_size, logits_seq_len, self.vocab_size],
+                        dtype=self.model_config.params_dtype,
+                        tensor=logits,
+                        pp_group=self.pp_group,
+                    )
+
+                
+                
+                if (
+                    context_end_position == min_prompt_length_in_batch
+                    and symmetric_ar_type is not None
+                    and nccl_all_reduce_for_prefill
+                ):
+                    if symmetric_ar_type is not None and nccl_all_reduce_for_prefill:
+                        unwrapped_model.set_symmetric_ar(symmetric_ar_type)
+
+                
+                
+                
+                generation_started = prompt_lengths_in_batch <= context_end_position
+                last_token_logits = logits[:, -1, :]
+
+                logits_for_top_n_prompt_logprobs = (
+                    logits
+                    if context_start_position == 0 and not sampling_params.skip_prompt_log_probs
+                    else None
+                )
+                sampled_logits = self.sample_from_logits(
+                    last_token_logits,
+                    sampling_params,
+                    self.vocab_size,
+                    generation_started=generation_started,
+                    top_n_logprobs_dict=top_n_logprobs_dict,
+                    logits=logits_for_top_n_prompt_logprobs,
+                )
+
+                if sampling_params.num_tokens_to_generate > 0:
+                    
+                    
+                    batch_prompt_tokens[generation_started, context_end_position] = sampled_logits[
+                        generation_started
+                    ]
+
+                
+                if sampling_params.return_log_probs:
+                    log_probs = F.log_softmax(logits, dim=2).to(torch.float32)
+
+                    indices = torch.unsqueeze(
+                        batch_prompt_tokens[
+                            :, (context_start_position + 1) : (context_end_position + 1)
+                        ],
+                        2,
+                    )
+                    
+                    assert output_log_probs is not None
+                    output_log_probs[:, context_start_position:context_end_position] = torch.gather(
+                        log_probs, 2, indices
+                    ).squeeze(2)
+
+                context_start_position = context_end_position
+
+                if sampling_params.num_tokens_to_generate > 0:
+                    
+                    
+                    (is_generation_done_tensor, generated_sequence_lengths) = (
+                        self.update_generation_status(
+                            updated_prompts_tokens=batch_prompt_tokens,
+                            generation_started=generation_started,
+                            current_context_end_position=context_end_position,
+                            is_generation_done_tensor=is_generation_done_tensor,
+                            generated_sequence_lengths=generated_sequence_lengths,
+                            termination_id=termination_id,
+                        )
+                    )
+
+                    
+                    if streaming_enabled:
+                        streaming_executor.submit(
+                            stream_tokens,
+                            streaming_request_ids,
+                            streaming_requests,
+                            streams,
+                            generation_started[streaming_idx].cpu(),
+                            is_generation_done_tensor[streaming_idx].cpu(),
+                            batch_prompt_tokens[streaming_idx].cpu(),
+                            prompt_lengths_in_batch[streaming_idx].cpu(),
+                            generated_sequence_lengths[streaming_idx].cpu(),
+                            (
+                                output_log_probs[streaming_idx].cpu()
+                                if output_log_probs is not None
+                                else [None] * len(streaming_idx)
+                            ),
+                        )
+
+                
+                all_prompts_done = torch.all(is_generation_done_tensor)
+                if all_prompts_done:
+                    break
+
+                
+                if torch.all(generation_started):
+                    self.inference_wrapped_model.inference_context.enable_decode_mode()
+                    
+                    if moe_pad_experts_for_cuda_graph_inference:
+                        capacity_factor = (
+                            model_config.num_moe_experts / model_config.moe_router_topk
+                        )
+                        set_decode_expert_padding(
+                            unwrapped_model, True, capacity_factor=capacity_factor
+                        )
+
+                context_end_position = context_start_position + 1
+                if context_end_position >= max_sequence_length:
+                    break
+
+        
+        timing_events.append(torch.cuda.Event(enable_timing=True))
+        timing_events[-1].record()
+
+        
+        if streaming_enabled:
+            streaming_executor.shutdown()
+            for stream in streams:
+                stream.finish()
+
+        
+        batch_prompt_tokens_with_generations = padded_batch_prompt_tokens[
+            :batch_size, : (context_end_position + 1)
+        ]
+        if sampling_params.return_log_probs:
+            assert output_log_probs is not None
+            output_log_probs = output_log_probs[:, :context_end_position]
+
+        generated_sequence_lengths[
+            generated_sequence_lengths > sampling_params.num_tokens_to_generate
+        ] = sampling_params.num_tokens_to_generate
+
+        timing_events[-1].synchronize()
+        tpot = torch.tensor(
+            [
+                timing_events[i].elapsed_time(timing_events[i + 1]) / 1e3
+                for i in range(len(timing_events) - 1)
+            ],
+            dtype=torch.float32,
+        )
+
+        for idx, request in enumerate(active_requests.values()):
+            input_prompt_length = int(prompt_lengths_in_batch[idx])
+            
+            required_sequence_length = int(
+                min(generated_sequence_lengths[idx], sampling_params.num_tokens_to_generate)
+            )
+            
+            required_result_tokens = batch_prompt_tokens_with_generations[
+                idx, input_prompt_length : (input_prompt_length + required_sequence_length)
+            ]
+            generated_sequence_lengths = generated_sequence_lengths.to(dtype=torch.int32)
+            request.generated_sequence_lengths = generated_sequence_lengths.to(dtype=torch.int32)
+            request.generated_length = required_sequence_length
+            request.generated_tokens = required_result_tokens
+
+            
+            request_tpot = tpot.clone()
+            
+            
+            spill_length = input_prompt_length - min_prompt_length_in_batch
+            if spill_length > 0:
+                spill_latency = request_tpot[:spill_length].sum()
+                request_tpot = torch.cat((spill_latency.unsqueeze(0), request_tpot[spill_length:]))
+
+            
+            
+            request_tpot = request_tpot[:required_sequence_length]
+            request.tpot = request_tpot.tolist()
+
+            if output_log_probs is not None:
+                request.prompt_log_probs = output_log_probs[idx, : input_prompt_length - 1].tolist()
+                request.generated_log_probs = output_log_probs[
+                    idx,
+                    input_prompt_length - 1 : (input_prompt_length + required_sequence_length - 1),
+                ].tolist()
+            if sampling_params.top_n_logprobs > 0:
+                if not sampling_params.skip_prompt_log_probs:
+                    assert (
+                        len(top_n_logprobs_dict[idx])
+                        >= input_prompt_length + required_sequence_length - 1
+                    ), (
+                        "Did not collect required number of top-N logprobs: "
+                        f"{len(top_n_logprobs_dict[idx])}"
+                    )
+                    request.prompt_top_n_logprobs = top_n_logprobs_dict[idx][
+                        : input_prompt_length - 1
+                    ]
+                    request.generated_top_n_logprobs = top_n_logprobs_dict[idx][
+                        input_prompt_length
+                        - 1 : (input_prompt_length + required_sequence_length - 1)
+                    ]
+                else:
+                    assert len(top_n_logprobs_dict[idx]) >= required_sequence_length, (
+                        "Did not collect required number of top-N logprobs: "
+                        f"{len(top_n_logprobs_dict[idx])}"
+                    )
+                    request.generated_top_n_logprobs = top_n_logprobs_dict[idx][
+                        :required_sequence_length
+                    ]
+
+            request.status = Status.COMPLETED
+
+            text, segments = self.detokenize_generations(
+                batch_prompt_tokens_with_generations[
+                    idx, : (input_prompt_length + required_sequence_length)
+                ],
+                input_prompt_length + generated_sequence_lengths,
+                sampling_params.return_segments,
+            )
+            request.text = text  
+            if sampling_params.return_segments:
+                request.segments = segments[0]
+            request.generated_text = text[len(request.prompt) :]
+        return active_requests
+
+    def prep_inference_input(
+        self,
+        prompts_tokens: torch.Tensor,
+        active_requests: OrderedDict[int, InferenceRequest],
+        use_attention_mask: bool = False,
+    ) -> Dict[str, Any]:
+        """Preparing input data for inference, using respective wrapper's prep_inference_input method # pylint: disable=line-too-long
+
+        Args:
+            prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]
+            active_requests (OrderedDict[int, InferenceRequest]): The input active requests
+            use_attention_mask (bool): Whether to use an attention mask. Should be set to True only
+                when exclusively doing prefill (no decode) with variable prompt lengths.
+
+        Returns:
+            A dict of the inference input for the current batch.
+        """
+        inference_input = self.inference_wrapped_model.prep_inference_input(prompts_tokens)
+
+        if use_attention_mask and (
+            attention_mask := inference_input.get("attention_mask", None) is None
+        ):
+            inference_input["attention_mask"] = get_attention_mask(prompts_tokens.size(1))
+
+        return inference_input
+
+    def stream_tokens(
+        self,
+        sampling_params: SamplingParams,
+        request_ids: List[int],
+        requests: List[InferenceRequest],
+        streams: List[AsyncStream],
+        generation_started: List[bool],
+        is_generation_done: List[bool],
+        tokens: torch.Tensor,
+        prompt_lengths: List[int],
+        generated_lengths: List[int],
+        output_log_probs: Union[torch.Tensor, None],
+    ):
+        """Asynchronously streams tokens for the given requests.
+
+        Args:
+            sampling_params (SamplingParams): The sampling parameters.
+            request_ids (List[int]): The request IDs.
+            request (List[InferenceRequest]): The requests.
+            stream (List[AsyncStream]): The streams over which to send tokens.
+            generation_started (List[bool]): Whether the decode step has started.
+            is_generation_done (List[bool]): Whether generation has completed.
+            tokens (torch.Tensor): The tokens for this request.
+            prompt_lengths (List[int]): The number of prompt tokens for each request.
+            generated_lengths (List[int]): The number of output tokens for each request.
+            output_log_probs (torch.Tensor, optional): The log probs for each request.
+        """
+
+        def stream_token(
+            request_id: int,
+            request: InferenceRequest,
+            stream: AsyncStream,
+            generation_started: bool,
+            is_generation_done: bool,
+            tokens: torch.Tensor,
+            prompt_length: int,
+            generated_length: int,
+            output_log_probs: Union[torch.Tensor, None],
+        ):
+            """Asynchronously streams a token for the given request."""
+
+            if (
+                not generation_started
+                or stream.finished
+                or sampling_params.num_tokens_to_generate == 0
+            ):
+                return
+
+            return_segments = sampling_params.return_segments
+            detokenize_streaming_text = not getattr(
+                sampling_params, "no_detokenize_streaming_text", False
+            )
+
+            generated_tokens = tokens[prompt_length : prompt_length + generated_length]
+
+            if detokenize_streaming_text:
+                generated_text, generated_segments = self.detokenize_generations(
+                    generated_tokens, prompt_length + generated_length, return_segments
+                )
+            else:
+                generated_text = ""
+                generated_segments = []
+
+            if output_log_probs is not None:
+                generated_log_probs = output_log_probs[
+                    prompt_length - 1 : prompt_length + generated_length - 1
+                ].tolist()
+            else:
+                generated_log_probs = None
+
+            stream.put(
+                InferenceRequest(
+                    request_id=request_id,
+                    prompt=request.prompt,
+                    sampling_params=request.sampling_params,
+                    prompt_tokens=request.prompt_tokens,
+                    arrival_time=request.arrival_time,
+                    status=request.status,
+                    encoder_prompt=request.encoder_prompt,
+                    generated_text=generated_text,
+                    generated_segments=generated_segments,
+                    generated_tokens=generated_tokens,
+                    generated_log_probs=generated_log_probs,
+                    generated_length=generated_length,
+                )
+            )
+
+            if is_generation_done or generated_length == sampling_params.num_tokens_to_generate:
+                stream.finish()
+
+        ret = map(
+            stream_token,
+            request_ids,
+            requests,
+            streams,
+            generation_started,
+            is_generation_done,
+            tokens,
+            prompt_lengths,
+            generated_lengths,
+            output_log_probs,
+        )
+        list(ret)

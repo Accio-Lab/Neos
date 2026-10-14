@@ -1,0 +1,89 @@
+                                                                                        
+                                                                    
+
+                              
+metrics:
+  enabled: false
+                                                               
+  port: 0
+
+controller:
+                                                                                         
+  sampler: SequentialSampler
+                                                                                                  
+  polling_mode: False
+                                                               
+  zmq_info: null
+
+
+backend:
+                                                                      
+                                               
+  storage_backend: SimpleStorage
+
+                                                                       
+  SimpleStorage:
+                                                                           
+    total_storage_size: 100000
+                                          
+                                                             
+    num_data_storage_units: 2
+                                                                 
+    zmq_info: null
+
+                                                                 
+                                                      
+  MooncakeStore:
+                                                                                    
+                                                                                                     
+    auto_init: true
+                                                  
+    metadata_server: localhost:50050
+                                            
+    master_server_address: localhost:50051
+                                                         
+                                                   
+    local_hostname: ""
+                                                 
+    protocol: tcp
+                                                                                    
+    global_segment_size: 4294967296
+                                                              
+    local_buffer_size: 1073741824
+                          
+                                                              
+    device_name: ""
+
+                 
+  Yuanrong:
+                                                   
+    auto_init: True
+                            
+    worker_port: 31501
+                            
+    metastore_port: 2379
+                                     
+    enable_yr_npu_transport: false
+                                                                                                           
+                                                                                                                                   
+    enable_rdma: false
+                                                                                                                                       
+                                                                                                                                                       
+                                                                                 
+                                                                                                      
+                                                                                          
+                                                                              
+                                                                                                
+    ucx_env_vars: {}
+                                            
+                                               
+                                                                                                                                   
+                                                                                                                               
+                                                                                           
+                                                                                                                   
+                                                                                                                       
+                                                                                                     
+    worker_args: "--shared_memory_size_mb 8192"
+
+                 
+  RayStore:

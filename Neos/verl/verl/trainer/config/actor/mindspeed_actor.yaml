@@ -1,0 +1,27 @@
+                                                                         
+defaults:
+  - ../optim@optim: megatron
+
+  - ../engine@mindspeed:
+      - megatron
+      - mindspeed
+
+  - actor
+
+                                                                                
+  - _self_
+
+_target_: verl.workers.config.MindSpeedActorConfig
+
+strategy: mindspeed
+
+                                                                    
+                                                                  
+                                                                           
+checkpoint:
+
+                                           
+  _target_: verl.workers.config.MindSpeedCheckpointConfig
+
+                             
+  mbridge_config: {}

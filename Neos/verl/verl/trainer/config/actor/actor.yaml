@@ -1,0 +1,335 @@
+                               
+                                           
+                                                   
+                                                                      
+                                                      
+
+                                     
+_target_: verl.workers.config.ActorConfig
+
+                                                         
+rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
+
+                            
+                                       
+strategy: ???
+
+                                                         
+ppo_mini_batch_size: 256
+
+                                      
+ppo_micro_batch_size: null
+
+                                
+ppo_micro_batch_size_per_gpu: null
+
+                                                       
+                                                             
+use_dynamic_bsz: false
+
+                                                                    
+                                                                                     
+                                                                   
+ppo_max_token_len_per_gpu: 16384
+
+                
+clip_ratio: 0.2
+
+                                                             
+clip_ratio_low: 0.2
+
+                                                             
+clip_ratio_high: 0.2
+
+                                                                                             
+                                                          
+tau_pos: 1.0
+
+                                             
+tau_neg: 1.05
+
+                                                                             
+freeze_vision_tower: false
+
+                    
+policy_loss:
+
+                                                                                             
+  _target_: verl.workers.config.PolicyLossConfig
+
+                                                                                              
+  loss_mode: "vanilla"
+
+                                                   
+  clip_cov_ratio: 0.0002
+
+                                 
+  clip_cov_lb: 1.0
+
+                                 
+  clip_cov_ub: 5.0
+
+                                                            
+  kl_cov_ratio: 0.0002
+
+                                     
+  ppo_kl_coef: 0.1
+
+                                                                     
+clip_ratio_c: 3.0
+
+                                                                                                                
+loss_agg_mode: token-mean
+
+                                                                   
+                                                                                      
+loss_scale_factor: null
+
+                                                
+entropy_coeff: 0
+
+                                                                  
+calculate_entropy: false
+
+                                                                                       
+                                                                                             
+calculate_sum_pi_squared: false
+
+                                                                    
+use_kl_loss: false
+
+                                                       
+use_prefix_grouper: false
+
+                                
+                                                      
+use_torch_compile: true
+
+                                                           
+kl_loss_coef: 0.001
+
+                                                                                           
+kl_loss_type: low_var_kl
+
+                                
+ppo_epochs: 1
+
+                                         
+shuffle: false
+
+                                       
+data_loader_seed: 42
+
+                    
+checkpoint:
+
+                                           
+  _target_: verl.trainer.config.CheckpointConfig
+
+                                        
+                                                                                                              
+  save_contents: ['model', 'optimizer', 'extra']
+
+                                                                                   
+                                                                                                
+  load_contents: ${.save_contents}
+
+                                                                                      
+  async_save: False
+
+                                                             
+  strict: True
+
+                   
+optim:
+
+                 
+  lr: 1e-6
+
+                                                                 
+  lr_warmup_steps_ratio: 0.0
+
+                                                        
+  total_training_steps: -1
+
+                
+  weight_decay: 0.01
+
+                                                                                     
+  lr_warmup_steps: -1
+
+
+                                                                       
+use_fused_kernels: ${oc.select:actor_rollout_ref.model.use_fused_kernels,false}
+
+                                             
+profiler:
+
+                                                                                           
+  _target_: verl.utils.profiler.ProfilerConfig
+
+                                                                 
+                             
+  tool: ${oc.select:global_profiler.tool,null}
+
+                                   
+  enable: False
+  
+                                 
+  all_ranks: False
+
+                                                    
+  ranks: []
+
+                               
+  save_path: ${oc.select:global_profiler.save_path,null}
+
+                                                       
+  tool_config:
+
+                      
+    nsys:
+
+                                                                                               
+      _target_: verl.utils.profiler.config.NsightToolConfig
+    
+                                                                                                             
+      discrete: ${oc.select:global_profiler.global_tool_config.nsys.discrete}
+    
+                
+    npu:
+
+                                                                                               
+      _target_: verl.utils.profiler.config.NPUToolConfig
+
+                                         
+                                                        
+      contents: []
+
+                                                                              
+      level: "level0"
+
+                                                
+      analysis: True
+
+                                                                                                             
+      discrete: False
+    
+                           
+    torch:
+
+                                                                                               
+      _target_: verl.utils.profiler.config.TorchProfilerToolConfig
+
+                                         
+                                                 
+      contents: []
+
+                                                                                                             
+      discrete: false
+
+                                                                                     
+                                                                               
+      schedule:
+
+                                                                                                 
+        _target_: verl.utils.profiler.config.TorchProfilerScheduleConfig
+
+                                                        
+        skip_first: 0
+
+                                                               
+        wait: 0
+
+                                                              
+        warmup: 0
+
+                                                                     
+        active: 0
+
+                                                                     
+        repeat: 0
+
+                                  
+    torch_memory:
+
+                                                                                               
+      _target_: verl.utils.profiler.config.TorchMemoryToolConfig
+
+                                                            
+      trace_alloc_max_entries: ${oc.select:global_profiler.global_tool_config.torch_memory.trace_alloc_max_entries,100000}
+
+                                                
+      stack_depth: ${oc.select:global_profiler.global_tool_config.torch_memory.stack_depth,32}
+
+                                       
+    precision_debugger:
+
+                                                                                               
+      _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
+
+                                   
+      config_path: ${oc.select:global_profiler.global_tool_config.precision_debugger.config_path,null}
+
+                                                          
+      steps: null
+
+                      
+                                                                                     
+                                                       
+      stages: ${oc.select:global_profiler.global_tool_config.precision_debugger.stages,null}
+
+                                                           
+      strict: ${oc.select:global_profiler.global_tool_config.precision_debugger.strict,False}
+
+                                            
+router_replay:
+
+                                           
+  _target_: verl.workers.config.RouterReplayConfig
+
+                                        
+                                               
+                                               
+  mode: disabled
+
+                                                
+                                                 
+  record_file: null
+
+                                                           
+                                  
+  replay_file: null
+
+                                                 
+               
+                                                                 
+                                                                                            
+                                                                    
+                                              
+                                                                                                                  
+                                                                                              
+qat:
+
+                         
+  enable: false
+
+                                                                                         
+  mode: "w4a16"
+
+                                               
+  group_size: 16
+
+                                                    
+  ignore_patterns:
+
+    - "lm_head"
+    - "embed_tokens"
+    - "re:.*mlp.gate$"
+
+                                                                                        
+  activation_observer: "static_minmax"
+
+                                              
+  quantization_config_path: null
+

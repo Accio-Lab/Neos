@@ -1,0 +1,98 @@
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+async_training:
+
+                                       
+  staleness_threshold: 0.1
+
+                                                                          
+                                                              
+  trigger_parameter_sync_step: 4
+  
+                                                                          
+  require_batches: 1
+
+                                                                                            
+                                                                                                            
+  partial_rollout: True
+
+                                      
+  use_trainer_do_validate: False
+
+                                                  
+                                                                              
+                                                                            
+                                                                                 
+  use_dynamic_resource_scheduling: False
+
+                                                                                
+  dynamic_schedule_policy: "default"
+
+                                                                       
+                                                
+                                                                       
+                                                             
+                                                                            
+  dynamic_schedule_deactivate_ratio: 0.3
+
+                                                                                 
+                                                                    
+  dynamic_schedule_enable_rebalance: True
+
+                                                                 
+  concurrent_samples_per_replica: 16
+
+                
+rollout:
+
+                                       
+  nnodes: 1
+
+                                                
+  n_gpus_per_node: 8
+
+                                                             
+  n: 4
+
+                                                                
+  total_rollout_steps: 100
+
+data:
+                                                         
+  gen_batch_size: 1
+
+actor_rollout_ref:
+
+  rollout:
+                                                                 
+    calculate_log_probs: True
+
+                                                                                         
+                                                                                       
+                                                                                      
+                                                                    
+    standalone_gpu_memory_utilization: null
+
+    checkpoint_engine:
+      backend: "nccl"
+
+  actor:
+                                             
+    use_rollout_log_probs: True
+
+  model:
+                                 
+    use_remove_padding: True
+
+
+                                                 
+                                                                             
+algorithm:
+  rollout_correction:
+    bypass_mode: True
