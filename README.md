@@ -8,7 +8,7 @@
   <a name="arxiv-badge" href="https://arxiv.org/abs/2610.17043"><img src="https://img.shields.io/badge/ArXiv-Neos-brown?logo=arxiv" alt="arXiv"></a>
   <a name="dataset-badge"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20huggingface-Dataset-blue" alt="Dataset"></a>
   <a name="model-badge"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20huggingface-Model-purple" alt="Hugging Face Checkpoints"></a>
-  <a name="citation-badge"><img src="https://img.shields.io/badge/Citation-BibTeX-green" alt="Citation"></a>
+  <a name="citation-badge" href="#citation"><img src="https://img.shields.io/badge/Citation-BibTeX-green" alt="Citation"></a>
 </p>
 
 ## 🧭 Overview
@@ -105,18 +105,21 @@ bash scripts/evaluate.sh --bench all10 --interleave-benchmarks
 
 Replace `all10` with a benchmark such as `browsecomp_vl`, `mm_browsecomp`, or `vdr` to run it individually. A new output directory is created automatically and printed at startup. To resume, pass `--out` with that directory, or reuse an explicit `--run-id`.
 
+<a id="citation"></a>
+
 ## 📚 Citation
 
 ```bibtex
-@misc{he2026neos,
+@misc{he2026neoslearninginterleavesearch,
   title         = {Neos: Learning to Interleave Search and Visual Reasoning},
   author        = {Ekko He and Jack Hong and Shilin Yan and Xintong Zhang
                    and Yujie Zhang and Wenjie Li and Haoran Sun and Kaixun Jiang
                    and Jiyuan Fu and Guannan Zhang and Hongwei Xue},
   year          = {2026},
-  eprint        = {},
+  eprint        = {2610.17043},
   archivePrefix = {arXiv},
-  url           = {}
+  primaryClass  = {cs.AI},
+  url           = {https://arxiv.org/abs/2610.17043}
 }
 ```
 
